@@ -1,0 +1,18 @@
+# ignore everything by default
+*
+
+# allow code files
+!*.py
+
+# allow markdown docs
+!*.md
+
+# allow git files
+!.gitignore
+
+# explicitly ignore data / outputs
+*.log
+*.csv
+*.json
+*.xlsx
+*.ipynb

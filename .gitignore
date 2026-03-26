@@ -13,6 +13,6 @@
 # explicitly ignore data / outputs
 *.log
 *.csv
-*.json
+*.jsonl
 *.xlsx
 *.ipynb

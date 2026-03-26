@@ -66,6 +66,11 @@ BOX_FRONTAL_MIN_RATIO = 0.20
 FLAT_STICKER_ASPECT_RATIO = 4.0   # 保留，供扩展用
 FLAT_STICKER_WIDTH_RATIO  = 0.65
 
+# ── 贴纸粘贴角度验证 ──────────────────────────────────────────────────────────
+# 贴纸长轴与包装盒水平方向的最大允许偏角（门店拍照允许轻微倾斜）
+# 8°~10° 为业务推荐值；可根据误杀率调整
+STICKER_ANGLE_MAX_DEG = 10.0
+
 # 包装盒检测：最大内部分辨率（过大会慢，过小轮廓会失真）
 BOX_DETECT_MAX_SIDE = 1200
 # ─────────────────────────────────────────────────────────────────────────────
@@ -588,6 +593,86 @@ def validate_sticker_position(
     }
 
 
+def normalize_horizontal_angle(rect_angle: float, rect_w: float, rect_h: float) -> float:
+    """
+    将 cv2.minAreaRect 返回的角度归一化为"长轴与水平方向的夹角"，范围 [-90, 90]。
+
+    cv2.minAreaRect 约定：角度在 (-90, 0]，表示矩形"宽向量"与水平轴的夹角。
+    当 w < h 时，宽向量指向短轴，"长轴"实为高方向，需要 +90° 修正。
+    """
+    angle = float(rect_angle)
+    if rect_w < rect_h:
+        angle += 90.0
+    while angle > 90.0:
+        angle -= 180.0
+    while angle < -90.0:
+        angle += 180.0
+    return angle
+
+
+def extract_poly_angle(poly) -> float | None:
+    """
+    从 OCR 四边形多边形提取文字框主轴角度。
+
+    返回: 长轴与水平方向夹角（度，[-90, 90]）；解析失败返回 None。
+    """
+    try:
+        pts = np.array(poly, dtype=np.float32)
+        _, (w, h), angle = cv2.minAreaRect(pts)
+        return normalize_horizontal_angle(angle, w, h)
+    except Exception:
+        return None
+
+
+def validate_angle(
+    sticker: dict,
+    polys: list,
+    box_angle_deg: float = 0.0,
+    angle_max_deg: float = STICKER_ANGLE_MAX_DEG,
+) -> tuple[bool, float | None, str]:
+    """
+    验证"扫码即领"贴纸的粘贴角度是否与包装盒水平方向对齐。
+
+    原理：
+      正向完整照片（Phase 1 已过滤）中包装盒水平边近似水平（box_angle ≈ 0°）。
+      用 minAreaRect 提取贴纸文字框主轴角度，计算与包装盒水平方向的相对偏角。
+      允许门店拍照轻微倾斜（±STICKER_ANGLE_MAX_DEG）。
+
+    参数：
+      sticker       : find_sticker_from_ocr() 的返回 dict（含 text_idx）
+      polys         : OCR 多边形列表（原图尺寸）
+      box_angle_deg : 包装盒水平基准角度（正向拍摄约为 0°）
+      angle_max_deg : 允许的最大偏角（默认 STICKER_ANGLE_MAX_DEG）
+
+    返回: (ok, delta_deg, detail)
+      ok        : True = 角度合规
+      delta_deg : 贴纸相对盒子水平方向的偏角（°），正值顺时针
+      detail    : 文字说明
+    """
+    text_idx = sticker.get("text_idx")
+    if text_idx is None or text_idx >= len(polys):
+        return True, None, "角度验证跳过（索引越界）"
+
+    sticker_angle = extract_poly_angle(polys[text_idx])
+    if sticker_angle is None:
+        return True, None, "角度验证跳过（多边形解析失败）"
+
+    delta = sticker_angle - box_angle_deg
+    # 归一化到 [-90, 90]
+    while delta > 90.0:
+        delta -= 180.0
+    while delta < -90.0:
+        delta += 180.0
+
+    ok = abs(delta) <= angle_max_deg
+    if ok:
+        detail = f"角度规范（偏转 {delta:+.1f}°，阈值 ±{angle_max_deg:.0f}°）"
+    else:
+        detail = f"角度异常：偏转 {delta:+.1f}°，超过阈值 ±{angle_max_deg:.0f}°"
+
+    return ok, round(delta, 2), detail
+
+
 def check_sticker_placement(
     sticker: dict,
     box_x: int, box_y: int, box_w: int, box_h: int,
@@ -602,13 +687,15 @@ def check_sticker_placement(
       - sticker 已由 find_sticker_from_ocr() 定位（不为 None）
       - box_x/y/w/h 已由 detect_box_bbox() 计算（非 fallback）
 
-    检测顺序（与原版相反）：
-      Step 1  位置验证（先做，不合规立即返回，跳过平铺检测节省时间）
-      Step 2  平铺错误检测（仅位置合规时才做）
+    检测顺序：
+      Step 1  位置验证  → 不合规（0）立即返回
+      Step 2  角度验证  → 不合规（3）立即返回（跳过平铺检测）
+      Step 3  平铺检测  → 平铺错误（2）立即返回
 
     返回 dict:
-      position_valid : 0=位置异常 | 1=规范 | 2=平铺错误
+      position_valid : 0=位置异常 | 1=规范 | 2=平铺错误 | 3=角度异常
       rel_x, rel_y   : 相对坐标
+      angle_deg      : 贴纸偏角（度）；None 表示跳过
       detail         : 文字说明
     """
     # ── Step 1：位置验证 ──────────────────────────────────────────────────────
@@ -618,10 +705,23 @@ def check_sticker_placement(
             "position_valid": 0,
             "rel_x": pos["rel_x"],
             "rel_y": pos["rel_y"],
+            "angle_deg": None,
             "detail": f"[{box_method}] {pos['detail']}",
         }
 
-    # ── Step 2：平铺错误检测（位置合规后才执行） ──────────────────────────────
+    # ── Step 2：角度验证（位置合规后才执行）─────────────────────────────────
+    # 正向完整照片（Phase 1 已过滤）包装盒水平边近似水平，故 box_angle=0
+    angle_ok, delta_deg, angle_detail = validate_angle(sticker, polys)
+    if not angle_ok:
+        return {
+            "position_valid": 3,
+            "rel_x": pos["rel_x"],
+            "rel_y": pos["rel_y"],
+            "angle_deg": delta_deg,
+            "detail": f"[{box_method}] {angle_detail}",
+        }
+
+    # ── Step 3：平铺错误检测（位置 + 角度均合规后才执行）────────────────────
     flat, flat_detail = is_flat_sticker(texts, polys, sticker["text_idx"],
                                         box_x, box_y, box_w, box_h)
     if flat:
@@ -629,6 +729,7 @@ def check_sticker_placement(
             "position_valid": 2,
             "rel_x": pos["rel_x"],
             "rel_y": pos["rel_y"],
+            "angle_deg": delta_deg,
             "detail": f"[{box_method}] {flat_detail}",
         }
 
@@ -636,6 +737,7 @@ def check_sticker_placement(
         "position_valid": 1,
         "rel_x": pos["rel_x"],
         "rel_y": pos["rel_y"],
+        "angle_deg": delta_deg,
         "detail": f"[{box_method}] {pos['detail']}",
     }
 
@@ -721,7 +823,8 @@ def save_result_immediately(result_dict: dict, csv_file: str, json_file: str):
 def _make_result(is_compliant, seal_exists, position_valid,
                  rel_x, rel_y, box_method, detail,
                  dual_code, dual_detail,
-                 watermark_time, watermark_location) -> dict:
+                 watermark_time, watermark_location,
+                 sticker_angle=None) -> dict:
     """构造统一的返回 dict（避免各处重复写键名）。"""
     return {
         "is_compliant":        is_compliant,
@@ -729,6 +832,7 @@ def _make_result(is_compliant, seal_exists, position_valid,
         "position_valid":      position_valid,
         "rel_x":               rel_x,
         "rel_y":               rel_y,
+        "sticker_angle":       sticker_angle,   # 贴纸偏角（°），None=跳过/不可用
         "box_method":          box_method,
         "detail":              detail,
         "dual_code":           dual_code,
@@ -857,8 +961,10 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
         best["box_method"], best["texts"], best["polys"],
     )
 
+    _angle = placement.get("angle_deg")   # 便于后续所有分支复用
+
     if placement["position_valid"] != 1:
-        # 位置异常（0）或平铺错误（2）→ 不合格，跳过双贴检测
+        # 位置异常(0) / 角度异常(3) / 平铺错误(2) → 不合格，跳过双贴检测
         result = _make_result(
             is_compliant=0, seal_exists=1,
             position_valid=placement["position_valid"],
@@ -867,6 +973,7 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
             dual_code=-1,
             dual_detail="单贴不合规，跳过双贴检测",
             watermark_time=watermark_time, watermark_location=watermark_location,
+            sticker_angle=_angle,
         )
         _print_summary(result)
         return result
@@ -882,6 +989,7 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
             box_method=best["box_method"], detail=placement["detail"],
             dual_code=2, dual_detail=dual["dual_detail"],
             watermark_time=watermark_time, watermark_location=watermark_location,
+            sticker_angle=_angle,
         )
         _print_summary(result)
         return result
@@ -905,6 +1013,7 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
                 dual_code=1,
                 dual_detail=f"双贴第二张位置异常：{auth_pos['detail']}",
                 watermark_time=watermark_time, watermark_location=watermark_location,
+                sticker_angle=_angle,
             )
             _print_summary(result)
             return result
@@ -916,6 +1025,7 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
                 box_method=best["box_method"], detail=placement["detail"],
                 dual_code=1, dual_detail=f"双贴合规：{auth_pos['detail']}",
                 watermark_time=watermark_time, watermark_location=watermark_location,
+                sticker_angle=_angle,
             )
             _print_summary(result)
             return result
@@ -927,6 +1037,7 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
         box_method=best["box_method"], detail=placement["detail"],
         dual_code=dual["dual_code"], dual_detail=dual["dual_detail"],
         watermark_time=watermark_time, watermark_location=watermark_location,
+        sticker_angle=_angle,
     )
     _print_summary(result)
     return result
@@ -937,7 +1048,8 @@ def _print_summary(r: dict):
     print(f"  是否规范粘贴  : {'✓ 合规(1)' if r['is_compliant'] == 1 else '✗ 不合规(0)'}")
     print(f"  封口贴存在    : {r['seal_exists']}")
     print(f"  位置规范      : {r['position_valid']}")
-    print(f"  贴纸相对X/Y   : {r['rel_x']} / {r['rel_y']}")
+    angle_str = f"{r['sticker_angle']:+.1f}°" if r.get('sticker_angle') is not None else "(未计算)"
+    print(f"  贴纸相对X/Y   : {r['rel_x']} / {r['rel_y']}  偏角: {angle_str}")
     print(f"  包装盒检测方式: {r['box_method']}")
     print(f"  说明          : {r['detail']}")
     print(f"  双贴纸状态    : {r['dual_code']}  ({r['dual_detail']})")
@@ -950,19 +1062,20 @@ def _print_summary(r: dict):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    input_file   = '/home/ubuntu/OCR/for_test.xlsx'
-    output_csv   = '/home/ubuntu/OCR/for_test_v2_results.csv'
-    output_json  = '/home/ubuntu/OCR/for_test_v2_results.jsonl'
-    output_excel = '/home/ubuntu/OCR/for_test_v2_processed.xlsx'
+    input_file   = '/home/ubuntu/OCR/出库照片3.18.xlsx'
+    output_csv   = '/home/ubuntu/OCR/出库照片3.18_v2_results.csv'
+    output_json  = '/home/ubuntu/OCR/出库照片3.18_v2_results.jsonl'
+    output_excel = '/home/ubuntu/OCR/出库照片3.18_v2_processed.xlsx'
 
     NEW_COLS = [
         '是否规范粘贴',     # 0=不合规 | 1=合规  ← 总体判断，放最前
         '封口贴存在',       # 0 / 1
-        '贴纸位置规范',     # -1=无贴纸 | 0=位置异常 | 1=位置规范 | 2=平铺错误
+        '贴纸位置规范',     # -1=无贴纸 | 0=位置异常 | 1=位置规范 | 2=平铺错误 | 3=角度异常
         '贴纸相对X',        # 0.0~1.0（相对包装盒宽度）
         '贴纸相对Y',        # 0.0~1.0（相对包装盒高度）
+        '贴纸角度',         # 贴纸长轴与包装盒水平方向的偏角（°）；空=未计算
         '包装盒检测方式',   # edge / bright / fallback
-        '位置说明',         # 文字说明
+        '位置说明',         # 文字说明（含角度/位置/平铺详情）
         '双贴纸状态',       # -1=无贴 | 0=单贴 | 1=双贴合规 | 2=双贴错误(两个扫码贴)
         '双贴纸说明',       # 文字说明
         '时间',
@@ -1020,6 +1133,7 @@ def main():
             result_row['贴纸位置规范']   = r['position_valid']
             result_row['贴纸相对X']      = r['rel_x'] if r['rel_x'] is not None else ''
             result_row['贴纸相对Y']      = r['rel_y'] if r['rel_y'] is not None else ''
+            result_row['贴纸角度']       = r['sticker_angle'] if r.get('sticker_angle') is not None else ''
             result_row['包装盒检测方式'] = r['box_method'] if r['box_method'] else ''
             result_row['位置说明']       = r['detail']
             result_row['双贴纸状态']     = r['dual_code']
@@ -1068,6 +1182,7 @@ def main():
     cnt_seal       = _cnt('封口贴存在', 1)
     cnt_no_seal    = _cnt('封口贴存在', 0)
     cnt_pos_bad    = _cnt('贴纸位置规范', 0)
+    cnt_angle_bad  = _cnt('贴纸位置规范', 3)
     cnt_flat       = _cnt('贴纸位置规范', 2)
     cnt_no_frontal = _cnt('贴纸位置规范', -1)
     cnt_dual_ok    = _cnt('双贴纸状态', 1)
@@ -1080,6 +1195,7 @@ def main():
     print(f"  ├─ 无正向完整照片    : {cnt_no_frontal} 行")
     print(f"  ├─ 无封口贴          : {cnt_no_seal} 行")
     print(f"  ├─ 位置异常          : {cnt_pos_bad} 行")
+    print(f"  ├─ 角度异常          : {cnt_angle_bad} 行  (偏角 > {STICKER_ANGLE_MAX_DEG:.0f}°)")
     print(f"  ├─ 平铺错误          : {cnt_flat} 行  (端片未绕侧面)")
     print(f"  └─ 双贴纸错误        : {cnt_dual_err} 行  (两个扫码贴)")
     print(f"双贴纸合规             : {cnt_dual_ok} 行  (扫码+授权专营)")

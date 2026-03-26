@@ -56,8 +56,8 @@ Phase 3 的核心函数，三步串行，每步可短路。
  ▼ Step 2  角度验证（validate_angle）
            用 cv2.minAreaRect 提取贴纸文字框主轴角度
            delta = sticker_angle - box_angle（正向拍摄时 box_angle ≈ 0°）
-           ┌─ |delta| ≤ 10°（STICKER_ANGLE_MAX_DEG）→ 继续
-           └─ |delta|  > 10°                        → position_valid=3，立即返回
+           ┌─ |delta| ≤ 30°（STICKER_ANGLE_MAX_DEG）→ 继续
+           └─ |delta|  > 30°                        → position_valid=3，立即返回
  │
  ▼ Step 3  平铺错误检测（is_flat_sticker）
            仅检查盒子范围内的 OCR 文字（盒外文字跳过）
@@ -88,7 +88,7 @@ Phase 3 的核心函数，三步串行，每步可短路。
    delta = sticker_angle - box_angle
         │   （正向完整照片中 box_angle ≈ 0°，即包装盒水平边近似水平）
         ▼
-   |delta| ≤ STICKER_ANGLE_MAX_DEG（10°）→ 合规
+   |delta| ≤ STICKER_ANGLE_MAX_DEG（30°）→ 合规
    |delta|  > STICKER_ANGLE_MAX_DEG     → position_valid=3，不合规
 ```
 
@@ -102,7 +102,7 @@ Phase 3 的核心函数，三步串行，每步可短路。
 | 场景 | 推荐阈值 |
 |------|---------|
 | 严格管控 | 6° |
-| 默认（当前配置） | **10°** |
+| 默认（当前配置） | **30°** |
 | 宽松容忍 | 12° ~ 15° |
 
 > 修改阈值只需改顶部常量：`STICKER_ANGLE_MAX_DEG = 8.0`
@@ -233,4 +233,4 @@ rel_y = (贴纸中心像素Y - 盒子上边界) / 盒子高度
 | 角度验证以包装盒水平为基准（`box_angle=0`） | 整体大幅倾斜拍摄时基准偏差，角度误判风险升高 | 搭配 Phase 1 的正向完整照片过滤可大幅降低此场景概率 |
 | 平铺检测依赖 OCR 识别"Authorized Reseller" | 英文模糊时可能漏判平铺 | 此时 `position_valid` 为 0（位置异常），不会误报合规 |
 | `rel_y` 范围 0%~30% 固定 | 不同品类贴法不同（如 Mac 贴在顶部侧面） | 可按 LOB 列配置不同阈值 |
-| `STICKER_ANGLE_MAX_DEG` 固定为 10° | 批量生产时不同品类/贴纸形态可能需要不同容忍度 | 可按 LOB 列配置不同阈值 |
+| `STICKER_ANGLE_MAX_DEG` 固定为 30° | 批量生产时不同品类/贴纸形态可能需要不同容忍度 | 可按 LOB 列配置不同阈值 |

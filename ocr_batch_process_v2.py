@@ -8,7 +8,12 @@
   2. 用 PaddleOCR 定位"扫码即领"文字的多边形坐标（换算回原图尺寸）
   3. 将贴纸中心转换为包装盒相对坐标系 (0.0~1.0)
   4. 验证贴纸是否在规范位置：宽度 60%~95%，高度 0%~30%
-
+ ▼ Step 0  非官方贴纸检测（detect_unofficial_sticker_color）
+           检测区域：整个包装盒（内缩 2% 边距）—— 不限制 rel_x / rel_y
+           官方白色封口贴饱和度极低，不会触发；经销商彩色自贴自然命中
+           转换为 HSV，寻找饱和度 > 80 的彩色连通区域（面积 ≥ 1.5%）
+           ┌─ 未检测到彩色区    → 继续
+           └─ 检测到彩色区      → position_valid=4，立即返回（疑似经销商自贴）
 根因修复：
   - 原方案同时检测"扫码即领"+"授权经销商"误判的原因：
     sticker 的 Apple Logo 中心本身印有"授权经销商"，
@@ -70,6 +75,14 @@ FLAT_STICKER_WIDTH_RATIO  = 0.65
 # 贴纸长轴与包装盒水平方向的最大允许偏角（门店拍照允许轻微倾斜）
 # 30° 为业务推荐值；可根据误杀率调整
 STICKER_ANGLE_MAX_DEG = 30.0
+
+# ── 非官方贴纸（经销商自贴）颜色检测 ─────────────────────────────────────────
+# 官方封口贴（"扫码即领"）以白色/米色为主，饱和度很低。
+# 经销商自贴往往有品牌色（暗红、蓝、橙等），饱和度明显更高。
+# 检测区域：包装盒下半部分（rel_y > 0.55），排除顶部官方贴纸区域。
+UNOFFICIAL_SAT_MIN   = 80    # HSV 饱和度下限（0~255）；>80 视为彩色
+UNOFFICIAL_VAL_RANGE = (40, 220)   # 亮度范围，排除纯黑/过曝
+UNOFFICIAL_AREA_RATIO = 0.015      # 彩色连通区最小面积占检测区比例（1.5%）
 
 # 包装盒检测：最大内部分辨率（过大会慢，过小轮廓会失真）
 BOX_DETECT_MAX_SIDE = 1200
@@ -356,6 +369,68 @@ def is_flat_sticker(
     return False, "未检测到端片文字（Authorized Reseller），贴纸未平铺"
 
 
+def detect_unofficial_sticker_color(
+    image_pil: Image.Image,
+    box_x: int, box_y: int, box_w: int, box_h: int,
+) -> tuple[bool, str]:
+    """
+    在整个包装盒区域用颜色检测经销商非官方贴纸。
+
+    原理：
+      官方"扫码即领"贴纸以白色/米色为主，HSV 饱和度很低（< 60），
+      不会触发高饱和阈值，因此无需排除官方贴纸所在位置。
+      经销商自贴通常带有品牌色（暗红、蓝紫、橙等），饱和度明显更高。
+
+    检测区域：整个包装盒（含 2% 内缩边距，排除盒子边框干扰）。
+      不再对 rel_x / rel_y 做区域限制，官方贴纸可出现在盒子任意位置。
+
+    返回: (has_unofficial: bool, detail: str)
+    """
+    try:
+        img_cv = pil_to_cv(image_pil)
+
+        # 截取整个包装盒区域（内缩 2% 避免盒子边框色块干扰）
+        margin_x = max(1, int(box_w * 0.02))
+        margin_y = max(1, int(box_h * 0.02))
+        x1 = max(0, box_x + margin_x)
+        y1 = max(0, box_y + margin_y)
+        x2 = min(img_cv.shape[1], box_x + box_w - margin_x)
+        y2 = min(img_cv.shape[0], box_y + box_h - margin_y)
+
+        zone = img_cv[y1:y2, x1:x2]
+        if zone.shape[0] < 10 or zone.shape[1] < 10:
+            return False, ""
+
+        hsv = cv2.cvtColor(zone, cv2.COLOR_BGR2HSV)
+        sat = hsv[:, :, 1]
+        val = hsv[:, :, 2]
+
+        # 高饱和 + 合理亮度 → 彩色像素
+        v_min, v_max = UNOFFICIAL_VAL_RANGE
+        mask = ((sat > UNOFFICIAL_SAT_MIN) & (val > v_min) & (val < v_max)).astype(np.uint8) * 255
+
+        # 形态学操作：合并相邻像素，消除噪点
+        k = np.ones((5, 5), np.uint8)
+        mask = cv2.dilate(mask, k, iterations=2)
+        mask = cv2.erode(mask, k, iterations=1)
+
+        # 找最大连通彩色区域
+        n_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        zone_area = zone.shape[0] * zone.shape[1]
+
+        for label in range(1, n_labels):   # 跳过背景(0)
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            ratio = area / max(zone_area, 1)
+            if ratio >= UNOFFICIAL_AREA_RATIO:
+                return True, (
+                    f"包装盒内检测到非白色彩色区域"
+                    f"（饱和色连通块占盒内面积 {ratio:.1%}，疑为经销商自贴）"
+                )
+        return False, ""
+    except Exception as e:
+        return False, f"颜色检测异常: {type(e).__name__}"
+
+
 def find_all_scan_stickers(texts: list[str], polys: list) -> list[dict]:
     """
     找出图中所有"扫码即领"文字的位置（可能有多个贴纸）。
@@ -378,6 +453,35 @@ def find_all_scan_stickers(texts: list[str], polys: list) -> list[dict]:
                 continue
     return stickers
 
+
+def has_dealer_only_sticker(texts: list[str]) -> tuple[bool, str]:
+    """
+    检测"无官方封口贴但疑似有其他内容"的文本辅助信号。
+
+    注意：
+      "授权经销商"/"Authorized Reseller" 是 Apple 官方贴纸上的字样，
+      不能作为经销商自贴触发词，否则会误杀合规订单。
+      主要非官方贴纸检测依赖颜色信号（detect_unofficial_sticker_color）；
+      此函数仅作为"整单无候选图"场景下的补充说明信号。
+
+    当前规则：
+      图片有 OCR 文字但没有任何 Apple 官方关键词 → 疑似经销商自贴图片
+    """
+    if not texts:
+        return False, ""
+    if any("扫码即领" in t for t in texts):
+        return False, ""
+
+    apple_kw = [
+        "扫码即领", "Apple", "apple",
+        "授权经销商", "Authorized Reseller", "Authorised Reseller",
+        "Apple授权专营店", "authorized reseller",
+    ]
+    has_any_apple = any(any(k in t for k in apple_kw) for t in texts)
+    if not has_any_apple and len(texts) >= 2:
+        sample = texts[0][:40]
+        return True, sample
+    return False, ""
 
 def check_dual_sticker_status(texts: list[str], polys: list, img_h: int) -> dict:
     """
@@ -567,7 +671,8 @@ def validate_sticker_position(
     rel_y = (sticker["cy"] - box_y) / box_h if box_h > 0 else -1.0
 
     x_ok = STICKER_X_MIN <= rel_x <= STICKER_X_MAX
-    y_ok = STICKER_Y_MIN <= rel_y <= STICKER_Y_MAX
+    # 业务更新：Y 仅做上限约束（rel_y <= 0.30）
+    y_ok = rel_y <= STICKER_Y_MAX
 
     if x_ok and y_ok:
         detail = f"位置规范 (rel_x={rel_x:.3f}, rel_y={rel_y:.3f})"
@@ -579,7 +684,7 @@ def validate_sticker_position(
             )
         if not y_ok:
             parts.append(
-                f"Y={rel_y:.3f} 不在 [{STICKER_Y_MIN},{STICKER_Y_MAX}]"
+                f"Y={rel_y:.3f} 超过上限 {STICKER_Y_MAX}"
             )
         detail = "位置异常：" + "；".join(parts)
 
@@ -877,6 +982,8 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
 
     # ═══ Phase 1：遍历所有图片，筛选候选 ════════════════════════════════════════
     candidates: list[dict] = []
+    dealer_only_hit = False
+    dealer_only_text = ""
 
     for col_idx, col, url, future in tasks:
         print(f"\n  第{col_idx}张图片: {url[:80]}...")
@@ -901,6 +1008,11 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
 
         # 快速筛选：必须含"扫码即领"（背面确认）
         if not any("扫码即领" in t for t in texts):
+            dealer_only, hit_text = has_dealer_only_sticker(texts)
+            if dealer_only and not dealer_only_hit:
+                dealer_only_hit = True
+                dealer_only_text = hit_text
+                print(f"  → 检测到疑似经销商自贴（关键词: {hit_text[:30]}），且无官方'扫码即领'")
             print("  → 未检测到'扫码即领'，非背面图，跳过")
             continue
 
@@ -916,16 +1028,35 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
             print(f"  → 包装盒面积占比={box_ratio:.2f} < {BOX_FRONTAL_MIN_RATIO}，非完整照片，跳过")
             continue
 
+        # 经销商非官方贴纸颜色检测（在盒子下半部分检测高饱和彩色区域）
+        has_unoff, unoff_detail = detect_unofficial_sticker_color(
+            image, box_x, box_y, box_w, box_h
+        )
+        if has_unoff:
+            print(f"  ⚠ 颜色检测：{unoff_detail}")
+
         print(f"  → 候选图片 ✓  盒子占比={box_ratio:.2f}，方法={box_method}")
         candidates.append({
             "texts": texts, "polys": polys_orig,
             "orig_h": orig_h, "orig_w": orig_w,
             "box_x": box_x, "box_y": box_y, "box_w": box_w, "box_h": box_h,
             "box_method": box_method, "box_ratio": box_ratio,
+            "has_unofficial": has_unoff,
+            "unofficial_detail": unoff_detail,
         })
 
     # ═══ Phase 2：无候选 → 不合格 ════════════════════════════════════════════
     if not candidates:
+        if dealer_only_hit:
+            result = _make_result(
+                is_compliant=0, seal_exists=0, position_valid=0,
+                rel_x=None, rel_y=None, box_method=None,
+                detail=f"检测到经销商自贴且无官方封口贴（关键词: {dealer_only_text[:50]}）",
+                dual_code=-1, dual_detail="跳过",
+                watermark_time=watermark_time, watermark_location=watermark_location,
+            )
+            _print_summary(result)
+            return result
         result = _make_result(
             is_compliant=0, seal_exists=0, position_valid=-1,
             rel_x=None, rel_y=None, box_method=None,
@@ -941,6 +1072,19 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
     print(f"\n  ✓ 选定候选图：盒子占比={best['box_ratio']:.2f}，方法={best['box_method']}")
 
     # ═══ Phase 3：单贴检测 ════════════════════════════════════════════════════
+
+    # Step 0：非官方贴纸检测（颜色信号，优先判断）
+    if best.get("has_unofficial"):
+        result = _make_result(
+            is_compliant=0, seal_exists=1, position_valid=4,
+            rel_x=None, rel_y=None, box_method=best["box_method"],
+            detail=f"检测到疑似经销商非官方贴纸：{best['unofficial_detail']}",
+            dual_code=-1, dual_detail="跳过",
+            watermark_time=watermark_time, watermark_location=watermark_location,
+        )
+        _print_summary(result)
+        return result
+
     sticker = find_sticker_from_ocr(best["texts"], best["polys"])
     if sticker is None:
         # 保底处理（正常不会走到这里）
@@ -1063,14 +1207,14 @@ def _print_summary(r: dict):
 
 def main():
     input_file   = '/home/ubuntu/OCR/出库照片3.18.xlsx'
-    output_csv   = '/home/ubuntu/OCR/出库照片3.18_v2_results.csv'
-    output_json  = '/home/ubuntu/OCR/出库照片3.18_v2_results.jsonl'
-    output_excel = '/home/ubuntu/OCR/出库照片3.18_v2_processed.xlsx'
+    output_csv   = '/home/ubuntu/OCR/出库照片3.18_v3_results.csv'
+    output_json  = '/home/ubuntu/OCR/出库照片3.18_v3_results.jsonl'
+    output_excel = '/home/ubuntu/OCR/出库照片3.18_v3_processed.xlsx'
 
     NEW_COLS = [
         '是否规范粘贴',     # 0=不合规 | 1=合规  ← 总体判断，放最前
         '封口贴存在',       # 0 / 1
-        '贴纸位置规范',     # -1=无贴纸 | 0=位置异常 | 1=位置规范 | 2=平铺错误 | 3=角度异常
+        '贴纸位置规范',     # -1=无贴纸 | 0=位置异常 | 1=位置规范 | 2=平铺错误 | 3=角度异常 | 4=非官方贴纸
         '贴纸相对X',        # 0.0~1.0（相对包装盒宽度）
         '贴纸相对Y',        # 0.0~1.0（相对包装盒高度）
         '贴纸角度',         # 贴纸长轴与包装盒水平方向的偏角（°）；空=未计算
@@ -1185,6 +1329,7 @@ def main():
     cnt_angle_bad  = _cnt('贴纸位置规范', 3)
     cnt_flat       = _cnt('贴纸位置规范', 2)
     cnt_no_frontal = _cnt('贴纸位置规范', -1)
+    cnt_unofficial = _cnt('贴纸位置规范', 4)
     cnt_dual_ok    = _cnt('双贴纸状态', 1)
     cnt_dual_err   = _cnt('双贴纸状态', 2)
 
@@ -1197,6 +1342,7 @@ def main():
     print(f"  ├─ 位置异常          : {cnt_pos_bad} 行")
     print(f"  ├─ 角度异常          : {cnt_angle_bad} 行  (偏角 > {STICKER_ANGLE_MAX_DEG:.0f}°)")
     print(f"  ├─ 平铺错误          : {cnt_flat} 行  (端片未绕侧面)")
+    print(f"  ├─ 非官方贴纸        : {cnt_unofficial} 行  (经销商彩色自贴)")
     print(f"  └─ 双贴纸错误        : {cnt_dual_err} 行  (两个扫码贴)")
     print(f"双贴纸合规             : {cnt_dual_ok} 行  (扫码+授权专营)")
     print(f"总耗时                 : {(time.time() - start_time) / 3600:.2f} 小时")

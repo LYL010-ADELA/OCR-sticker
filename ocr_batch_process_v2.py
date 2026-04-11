@@ -10,10 +10,14 @@
   4. 验证贴纸是否在规范位置：宽度 60%~95%，高度 0%~30%
  ▼ Step 0  非官方贴纸检测（detect_unofficial_sticker_color）
            检测区域：整个包装盒（内缩 2% 边距）—— 不限制 rel_x / rel_y
-           官方白色封口贴饱和度极低，不会触发；经销商彩色自贴自然命中
-           转换为 HSV，寻找饱和度 > 80 的彩色连通区域（面积 ≥ 1.5%）
-           ┌─ 未检测到彩色区    → 继续
-           └─ 检测到彩色区      → position_valid=4，立即返回（疑似经销商自贴）
+           【改进版：包装盒颜色归一化 + 形状/边缘验证】
+           ① 白平衡归一化：采样盒面高亮低饱和像素估计光照色偏基准（bg_sat_ref），
+              有效饱和度 = 原始S − bg_sat_ref − 10，消除阴影/灯光带来的全局色偏
+           ② 高效饱和掩码：有效饱和度 > 55 且亮度在合理范围 → 候选彩色像素
+           ③ 形状紧实度（Solidity）过滤：连通区 Solidity < 0.45 → 阴影/反光，跳过
+           ④ 边缘梯度过滤：边界处饱和度梯度 < 6 → 渐变色偏（阴影），跳过
+           ┌─ 未检出合规彩色区    → 继续
+           └─ 检出合规彩色区      → position_valid=4，立即返回（疑似经销商自贴）
 根因修复：
   - 原方案同时检测"扫码即领"+"授权经销商"误判的原因：
     sticker 的 Apple Logo 中心本身印有"授权经销商"，
@@ -77,12 +81,14 @@ FLAT_STICKER_WIDTH_RATIO  = 0.65
 STICKER_ANGLE_MAX_DEG = 30.0
 
 # ── 非官方贴纸（经销商自贴）颜色检测 ─────────────────────────────────────────
-# 官方封口贴（"扫码即领"）以白色/米色为主，饱和度很低。
-# 经销商自贴往往有品牌色（暗红、蓝、橙等），饱和度明显更高。
-# 检测区域：包装盒下半部分（rel_y > 0.55），排除顶部官方贴纸区域。
-UNOFFICIAL_SAT_MIN   = 80    # HSV 饱和度下限（0~255）；>80 视为彩色
-UNOFFICIAL_VAL_RANGE = (40, 220)   # 亮度范围，排除纯黑/过曝
-UNOFFICIAL_AREA_RATIO = 0.015      # 彩色连通区最小面积占检测区比例（1.5%）
+# 改进版：先对包装盒做白平衡归一化，再检测"相对于背景"的超饱和区域。
+# 归一化消除门店灯光色偏、阴影等环境因素，避免误判。
+# 额外校验：形状紧实度（Solidity）+ 边缘清晰度（梯度），进一步排除阴影。
+UNOFFICIAL_SAT_ABOVE_BG  = 55   # 归一化后有效饱和度阈值（相对于背景基准）
+UNOFFICIAL_VAL_RANGE     = (40, 230)   # 亮度范围，排除纯黑/过曝
+UNOFFICIAL_AREA_RATIO    = 0.015       # 彩色连通区最小面积占检测区比例（1.5%）
+UNOFFICIAL_SOLIDITY_MIN  = 0.45        # 最低形状紧实度，低于此视为阴影/反光
+UNOFFICIAL_EDGE_GRAD_MIN = 6.0         # 边缘饱和度梯度最低值，低于此为渐变阴影
 
 # 包装盒检测：最大内部分辨率（过大会慢，过小轮廓会失真）
 BOX_DETECT_MAX_SIDE = 1200
@@ -374,15 +380,18 @@ def detect_unofficial_sticker_color(
     box_x: int, box_y: int, box_w: int, box_h: int,
 ) -> tuple[bool, str]:
     """
-    在整个包装盒区域用颜色检测经销商非官方贴纸。
+    改进版：基于包装盒颜色归一化的非官方贴纸检测。
 
-    原理：
-      官方"扫码即领"贴纸以白色/米色为主，HSV 饱和度很低（< 60），
-      不会触发高饱和阈值，因此无需排除官方贴纸所在位置。
-      经销商自贴通常带有品牌色（暗红、蓝紫、橙等），饱和度明显更高。
+    核心改进：
+      1. 白平衡归一化：采样包装盒高亮低饱和区域（真实白色背景），
+         估计全局光照/阴影引起的色偏，将整个区域饱和度减去该基准偏置，
+         消除门店灯光色偏、手部阴影等环境因素。
+      2. 形状紧实度（Solidity）过滤：真实贴纸是紧凑矩形块（Solidity > 0.45），
+         阴影/反光形状不规则，Solidity 低，可有效区分。
+      3. 边缘清晰度过滤：贴纸边缘饱和度梯度大（界限清晰），
+         阴影是渐变，梯度小，可进一步排除渐变色偏区域。
 
-    检测区域：整个包装盒（含 2% 内缩边距，排除盒子边框干扰）。
-      不再对 rel_x / rel_y 做区域限制，官方贴纸可出现在盒子任意位置。
+    检测区域：整个包装盒（内缩 2% 边距，排除盒子边框干扰）。
 
     返回: (has_unofficial: bool, detail: str)
     """
@@ -401,31 +410,91 @@ def detect_unofficial_sticker_color(
         if zone.shape[0] < 10 or zone.shape[1] < 10:
             return False, ""
 
-        hsv = cv2.cvtColor(zone, cv2.COLOR_BGR2HSV)
-        sat = hsv[:, :, 1]
-        val = hsv[:, :, 2]
+        # ── Step 1: 白平衡归一化 ──────────────────────────────────────────────
+        # 将包装盒区域转为 HSV，浮点以便后续运算
+        hsv_f = cv2.cvtColor(zone, cv2.COLOR_BGR2HSV).astype(np.float32)
+        s_raw = hsv_f[:, :, 1]   # 0~255
+        v_raw = hsv_f[:, :, 2]   # 0~255
 
-        # 高饱和 + 合理亮度 → 彩色像素
+        # 高亮（V > 180）+ 低饱和（S < 55）的像素 = 包装盒真实白色背景
+        white_mask = (v_raw > 180) & (s_raw < 55)
+        if white_mask.sum() > 200:
+            # 取白色参考区域的 90th 百分位饱和度作为光照色偏基准
+            bg_sat_ref = float(np.percentile(s_raw[white_mask], 90))
+        else:
+            # 白色参考不足（深色盒子等特殊情况），不做归一化
+            bg_sat_ref = 0.0
+
+        # 有效饱和度 = 原始饱和度 − 背景基准（再减10点宽容量）
+        eff_sat = np.clip(s_raw - bg_sat_ref - 10.0, 0.0, 255.0)
+
+        # ── Step 2: 彩色像素掩码（归一化后） ────────────────────────────────
         v_min, v_max = UNOFFICIAL_VAL_RANGE
-        mask = ((sat > UNOFFICIAL_SAT_MIN) & (val > v_min) & (val < v_max)).astype(np.uint8) * 255
+        color_mask = (
+            (eff_sat > UNOFFICIAL_SAT_ABOVE_BG) &
+            (v_raw > v_min) & (v_raw < v_max)
+        ).astype(np.uint8) * 255
 
-        # 形态学操作：合并相邻像素，消除噪点
-        k = np.ones((5, 5), np.uint8)
-        mask = cv2.dilate(mask, k, iterations=2)
-        mask = cv2.erode(mask, k, iterations=1)
+        # 形态学：合并相邻像素，消除噪点
+        k5 = np.ones((5, 5), np.uint8)
+        color_mask = cv2.dilate(color_mask, k5, iterations=2)
+        color_mask = cv2.erode(color_mask, k5, iterations=2)
 
-        # 找最大连通彩色区域
-        n_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        # ── Step 3: 连通区分析 + 形状/边缘验证 ──────────────────────────────
+        n_labels, label_img, stats, _ = cv2.connectedComponentsWithStats(
+            color_mask, connectivity=8
+        )
         zone_area = zone.shape[0] * zone.shape[1]
+
+        # 预计算归一化饱和度梯度图（用于边缘清晰度检测）
+        eff_sat_u8 = np.clip(eff_sat, 0, 255).astype(np.uint8)
+        gx = cv2.Sobel(eff_sat_u8, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(eff_sat_u8, cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = np.sqrt(gx ** 2 + gy ** 2)
 
         for label in range(1, n_labels):   # 跳过背景(0)
             area = int(stats[label, cv2.CC_STAT_AREA])
             ratio = area / max(zone_area, 1)
-            if ratio >= UNOFFICIAL_AREA_RATIO:
-                return True, (
-                    f"包装盒内检测到非白色彩色区域"
-                    f"（饱和色连通块占盒内面积 {ratio:.1%}，疑为经销商自贴）"
-                )
+            if ratio < UNOFFICIAL_AREA_RATIO:
+                continue
+
+            comp_mask = (label_img == label).astype(np.uint8)
+
+            # ── 形状紧实度（Solidity）────────────────────────────────────────
+            # 贴纸是紧凑矩形，Solidity 高；阴影轮廓不规则，Solidity 低
+            contours, _ = cv2.findContours(
+                comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            if not contours:
+                continue
+            cnt = max(contours, key=cv2.contourArea)
+            hull = cv2.convexHull(cnt)
+            hull_area = cv2.contourArea(hull)
+            if hull_area < 1:
+                continue
+            solidity = cv2.contourArea(cnt) / hull_area
+
+            if solidity < UNOFFICIAL_SOLIDITY_MIN:
+                # 形状太不规则，判定为阴影/光照伪影，跳过
+                continue
+
+            # ── 边缘清晰度（饱和度梯度） ─────────────────────────────────────
+            # 提取连通区边界像素环（膨胀 − 腐蚀）
+            k3 = np.ones((3, 3), np.uint8)
+            boundary = (cv2.dilate(comp_mask, k3) - cv2.erode(comp_mask, k3)).astype(bool)
+            mean_edge_grad = float(grad_mag[boundary].mean()) if boundary.any() else 0.0
+
+            if mean_edge_grad < UNOFFICIAL_EDGE_GRAD_MIN:
+                # 边缘为渐变，判定为阴影/环境光色偏，跳过
+                continue
+
+            return True, (
+                f"包装盒内检测到非白色彩色区域"
+                f"（归一化有效饱和色块占盒内面积 {ratio:.1%}，"
+                f"紧实度 {solidity:.2f}，边缘梯度 {mean_edge_grad:.1f}，"
+                f"背景色偏基准 S={bg_sat_ref:.1f}，疑为经销商自贴）"
+            )
+
         return False, ""
     except Exception as e:
         return False, f"颜色检测异常: {type(e).__name__}"
@@ -1206,10 +1275,10 @@ def _print_summary(r: dict):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    input_file   = '/home/ubuntu/OCR/出库照片3.18.xlsx'
-    output_csv   = '/home/ubuntu/OCR/出库照片3.18_v3_results.csv'
-    output_json  = '/home/ubuntu/OCR/出库照片3.18_v3_results.jsonl'
-    output_excel = '/home/ubuntu/OCR/出库照片3.18_v3_processed.xlsx'
+    input_file   = '/home/ubuntu/OCR/????? 件附件内容-0407-V2.xlsx'
+    output_csv   = '/home/ubuntu/OCR/????? 件附件内容-0407-V2_results.csv'
+    output_json  = '/home/ubuntu/OCR/????? 件附件内容-0407-V2_results.jsonl'
+    output_excel = '/home/ubuntu/OCR/????? 件附件内容-0407-V2_processed.xlsx'
 
     NEW_COLS = [
         '是否规范粘贴',     # 0=不合规 | 1=合规  ← 总体判断，放最前

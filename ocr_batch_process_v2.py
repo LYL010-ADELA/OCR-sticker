@@ -92,6 +92,163 @@ UNOFFICIAL_EDGE_GRAD_MIN = 6.0         # 边缘饱和度梯度最低值，低于
 
 # 包装盒检测：最大内部分辨率（过大会慢，过小轮廓会失真）
 BOX_DETECT_MAX_SIDE = 1200
+
+# ── 多 LOB 配置（key 严格对齐 Excel `LOB` 列枚举）──────────────────────────────
+#   sticker_count:   "single_only"    仅单贴（AirPods/Accy.）
+#                    "single_or_dual" 单贴或双贴均合规（iPhone/Watch/iPad/Mac）
+#                    "dual_required"  必须双贴（当前未启用，保留扩展口径）
+#   scan_sticker:    一贴（扫码即领）规范相对坐标 {x_min,x_max,y_min,y_max}
+#                    y_max 为上限约束；y_min 用于文档说明，实际检测仅校验 x 范围与 y_max
+#   auth_sticker:    二贴（Apple 授权专营店）规范相对坐标，None 表示该 LOB 无二贴
+#   unofficial_color: 非官方贴纸颜色检测配置
+#     enabled:        是否启用
+#     mode:           "white_box" 白盒（白平衡归一化 + 相对饱和度，适用 iPhone/Watch/AirPods/Accy./iPad）
+#                     "brown_box" 棕盒（排除棕 + 排除白 + 绝对饱和度，适用 Mac）
+#     其他阈值:       详见各 LOB 字段
+LOB_CONFIGS: dict[str, dict] = {
+    "iPhone": {
+        "sticker_count": "single_or_dual",
+        "scan_sticker": {"x_min": 0.50, "x_max": 0.95, "y_min": 0.00, "y_max": 0.30},
+        "auth_sticker": {"x_min": 0.50, "x_max": 0.95, "y_min": 0.70, "y_max": 1.00},
+        "unofficial_color": {
+            "enabled": True,
+            "mode": "white_box",
+            "sat_above_bg": 55,
+            "val_range": (40, 230),
+            "area_ratio": 0.015,
+            "solidity_min": 0.45,
+            "edge_grad_min": 6.0,
+        },
+    },
+    "Watch": {
+        "sticker_count": "single_or_dual",
+        "scan_sticker": {"x_min": 0.15, "x_max": 0.70, "y_min": 0.05, "y_max": 0.40},
+        "auth_sticker": {"x_min": 0.15, "x_max": 0.70, "y_min": 0.60, "y_max": 0.95},
+        "unofficial_color": {
+            "enabled": True,
+            "mode": "white_box",
+            "sat_above_bg": 55,
+            "val_range": (40, 230),
+            "area_ratio": 0.015,
+            "solidity_min": 0.45,
+            "edge_grad_min": 6.0,
+        },
+    },
+    "AirPods": {
+        "sticker_count": "single_only",
+        "scan_sticker": {"x_min": 0.50, "x_max": 0.95, "y_min": 0.00, "y_max": 0.50},
+        "auth_sticker": None,
+        "unofficial_color": {
+            "enabled": True,
+            "mode": "white_box",
+            "sat_above_bg": 55,
+            "val_range": (40, 230),
+            "area_ratio": 0.015,
+            "solidity_min": 0.45,
+            "edge_grad_min": 6.0,
+        },
+    },
+    "Accy.": {
+        "sticker_count": "single_only",
+        "scan_sticker": {"x_min": 0.50, "x_max": 0.95, "y_min": 0.00, "y_max": 0.50},
+        "auth_sticker": None,
+        "unofficial_color": {
+            "enabled": True,
+            "mode": "white_box",
+            "sat_above_bg": 55,
+            "val_range": (40, 230),
+            "area_ratio": 0.015,
+            "solidity_min": 0.45,
+            "edge_grad_min": 6.0,
+        },
+    },
+    "iPad": {
+        "sticker_count": "single_or_dual",
+        "scan_sticker": {"x_min": 0.50, "x_max": 0.95, "y_min": 0.00, "y_max": 0.30},
+        "auth_sticker": {"x_min": 0.50, "x_max": 0.95, "y_min": 0.70, "y_max": 1.00},
+        "unofficial_color": {
+            "enabled": True,
+            "mode": "white_box",
+            "sat_above_bg": 55,
+            "val_range": (40, 230),
+            "area_ratio": 0.015,
+            "solidity_min": 0.45,
+            "edge_grad_min": 6.0,
+        },
+    },
+    "Mac": {
+        "sticker_count": "single_or_dual",
+        "scan_sticker": {"x_min": 0.25, "x_max": 0.75, "y_min": 0.70, "y_max": 1.00},
+        "auth_sticker": {"x_min": 0.05, "x_max": 0.50, "y_min": 0.00, "y_max": 0.30},
+        "unofficial_color": {
+            "enabled": True,
+            "mode": "brown_box",
+            "brown_hue_range": (5, 30),
+            "brown_sat_min": 30,
+            "brown_val_range": (40, 200),
+            "white_sat_max": 30,
+            "white_val_min": 200,
+            "sat_min_abs": 80,
+            "val_range": (50, 240),
+            "area_ratio": 0.015,
+            "solidity_min": 0.45,
+            "edge_grad_min": 6.0,
+        },
+    },
+}
+
+# 无法识别 LOB 时使用的默认配置（iPhone 规则，向下兼容）
+DEFAULT_LOB = "iPhone"
+
+# 产品名/MPN 关键词降级匹配表（仅在 Excel LOB 列缺失或值异常时使用）
+_LOB_KEYWORDS: list[tuple[str, list[str]]] = [
+    ("iPhone",  ["iPhone", "iphone"]),
+    ("Watch",   ["Apple Watch", "AppleWatch", "Watch"]),
+    ("AirPods", ["AirPods", "airpods"]),
+    ("iPad",    ["iPad", "ipad"]),
+    ("Mac",     ["MacBook", "iMac", "Mac mini", "Mac Pro", "Mac Studio", "Mac"]),
+    ("Accy.",   ["Adapter", "Cable", "MagSafe", "Lightning", "USB-C Power",
+                 "充电器", "数据线", "保护壳", "配件"]),
+]
+
+UNRECOGNIZED_LOB = "无法识别"
+
+def detect_lob(row) -> str:
+    """
+    识别订单行对应的 LOB（产品线）。
+
+    优先级：
+      1. 直接读 row["LOB"]，与 LOB_CONFIGS key 精确匹配（strip）
+      2. 关键词匹配 row["平台对接码(MPN)"] / "品牌对接码(UPC)" / 订单描述
+      3. 任一路径均无法命中 → 返回 UNRECOGNIZED_LOB（"无法识别"）
+
+    返回值：LOB_CONFIGS 中的 key，或 "无法识别"（调用方负责兜底）。
+    """
+    try:
+        raw = row.get("LOB", None)
+        if raw is not None and not (isinstance(raw, float) and np.isnan(raw)):
+            key = str(raw).strip()
+            if key in LOB_CONFIGS:
+                return key
+    except Exception:
+        pass
+
+    # 降级：关键词匹配 MPN / 产品描述相关列
+    candidates = []
+    for col in ("平台对接码(MPN)", "品牌对接码(UPC)", "门店名称"):
+        try:
+            v = row.get(col, "")
+            if v is not None and not (isinstance(v, float) and np.isnan(v)):
+                candidates.append(str(v))
+        except Exception:
+            continue
+    joined = " ".join(candidates)
+    if joined:
+        for lob_key, kws in _LOB_KEYWORDS:
+            if any(kw.lower() in joined.lower() for kw in kws):
+                return lob_key
+
+    return UNRECOGNIZED_LOB
 # ─────────────────────────────────────────────────────────────────────────────
 
 print("=" * 80)
@@ -300,6 +457,246 @@ def detect_box_bbox(image_pil: Image.Image) -> tuple[int, int, int, int, str]:
     return 0, 0, W, H, 'fallback'
 
 
+# ─── 包装盒透视矫正 ──────────────────────────────────────────────────────────
+
+def _order_quad_corners(pts: np.ndarray) -> np.ndarray:
+    """
+    对 4 个点按「左上(TL), 右上(TR), 右下(BR), 左下(BL)」顺序重排。
+    典型 sum/diff trick：TL 的 x+y 最小、BR 最大；TR 的 x-y 最大、BL 最小。
+    """
+    pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
+    s = pts.sum(axis=1)
+    d = pts[:, 0] - pts[:, 1]
+    rect = np.zeros((4, 2), dtype=np.float32)
+    rect[0] = pts[np.argmin(s)]   # TL
+    rect[2] = pts[np.argmax(s)]   # BR
+    rect[1] = pts[np.argmax(d)]   # TR
+    rect[3] = pts[np.argmin(d)]   # BL
+    return rect
+
+
+def _find_box_quad(img_cv: np.ndarray) -> np.ndarray | None:
+    """
+    尝试在图像中找到包装盒的 4 顶点四边形（原图坐标系）。
+    使用 Canny+膨胀 → 最大轮廓 → approxPolyDP；
+    返回形状 (4, 2) 的 float32 数组；失败返回 None。
+    """
+    H, W = img_cv.shape[:2]
+    scale = min(1.0, BOX_DETECT_MAX_SIDE / max(H, W))
+    dW, dH = max(1, int(W * scale)), max(1, int(H * scale))
+    img_small = cv2.resize(img_cv, (dW, dH), interpolation=cv2.INTER_AREA)
+
+    gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
+    filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+    edges = cv2.Canny(filtered, 20, 80)
+    kernel = np.ones((9, 9), np.uint8)
+    dilated = cv2.dilate(edges, kernel, iterations=3)
+
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    MIN_AREA_RATIO = 0.08
+    MAX_ASPECT = 5.0
+
+    for cnt in contours[:10]:
+        if cv2.contourArea(cnt) < MIN_AREA_RATIO * dW * dH:
+            continue
+        peri = cv2.arcLength(cnt, True)
+        # 逐步放宽 eps，尽可能拟合到 4 点
+        for eps_ratio in (0.02, 0.03, 0.04, 0.05):
+            approx = cv2.approxPolyDP(cnt, eps_ratio * peri, True)
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                quad = approx.reshape(4, 2).astype(np.float32)
+                xs = quad[:, 0]; ys = quad[:, 1]
+                w_hat = max(xs) - min(xs)
+                h_hat = max(ys) - min(ys)
+                if min(w_hat, h_hat) < 10:
+                    break
+                aspect = w_hat / max(h_hat, 1.0)
+                if not ((1.0 / MAX_ASPECT) <= aspect <= MAX_ASPECT):
+                    break
+                # 还原到原图坐标系
+                quad_orig = quad / scale
+                return quad_orig.astype(np.float32)
+            if len(approx) > 4:
+                continue
+            if len(approx) < 4:
+                break
+    return None
+
+
+def rectify_package_box(image_pil: Image.Image) -> dict:
+    """
+    包装盒矫正（三级降级）：
+        1) 四点透视矫正（perspective）：approxPolyDP 得到凸四边形 → warpPerspective
+        2) minAreaRect 旋转矫正（rotation）：最大轮廓最小外接旋转矩形 → warpAffine 后裁剪
+        3) 轴对齐兜底（axis_aligned）：复用现行 detect_box_bbox 的轴对齐 bbox
+
+    OCR 仍在原图上跑，识别完成后通过返回的 `M` 把原图 OCR 多边形映射到矫正坐标系。
+    矫正后坐标系中，包装盒覆盖 (0, 0) ~ (W_rect, H_rect)，贴纸相对坐标 = 除以 W_rect/H_rect。
+
+    返回 dict：
+        warped_img:   np.ndarray  矫正后 BGR 图（axis_aligned 兜底时为裁剪后的 bbox 子图）
+        M:            np.ndarray | None  3×3 原图→矫正图矩阵；axis_aligned 时为 None
+        W_rect,H_rect:int          矫正坐标系尺寸
+        method:       "perspective" / "rotation" / "axis_aligned"
+        box_quad_src: list | None  原图 4 角点坐标（顺序 TL,TR,BR,BL）
+        box_x/y/w/h:  int          原图轴对齐 bbox（诊断用；perspective 时等于四点 bbox）
+    """
+    img_cv = pil_to_cv(image_pil)
+    H_img, W_img = img_cv.shape[:2]
+
+    # ── 策略 1：四点透视矫正 ─────────────────────────────────────────────────
+    quad = _find_box_quad(img_cv)
+    if quad is not None:
+        try:
+            ordered = _order_quad_corners(quad)
+            tl, tr, br, bl = ordered
+            # 取上下边与左右边的最长距离作为矫正尺寸
+            w_top    = float(np.linalg.norm(tr - tl))
+            w_bottom = float(np.linalg.norm(br - bl))
+            h_left   = float(np.linalg.norm(bl - tl))
+            h_right  = float(np.linalg.norm(br - tr))
+            W_rect = max(1, int(round(max(w_top, w_bottom))))
+            H_rect = max(1, int(round(max(h_left, h_right))))
+
+            # clip 以控制后续检测耗时与显存
+            clip_scale = min(1.0, BOX_DETECT_MAX_SIDE / max(W_rect, H_rect))
+            if clip_scale < 1.0:
+                W_rect = max(1, int(round(W_rect * clip_scale)))
+                H_rect = max(1, int(round(H_rect * clip_scale)))
+
+            dst = np.array([
+                [0, 0], [W_rect - 1, 0],
+                [W_rect - 1, H_rect - 1], [0, H_rect - 1],
+            ], dtype=np.float32)
+            M = cv2.getPerspectiveTransform(ordered, dst)
+            warped = cv2.warpPerspective(img_cv, M, (W_rect, H_rect))
+
+            # 轴对齐 bbox（诊断/兜底用）
+            xs = ordered[:, 0]; ys = ordered[:, 1]
+            box_x = int(max(0, np.floor(xs.min())))
+            box_y = int(max(0, np.floor(ys.min())))
+            box_w = int(min(W_img - box_x, np.ceil(xs.max()) - box_x))
+            box_h = int(min(H_img - box_y, np.ceil(ys.max()) - box_y))
+
+            return {
+                "warped_img":    warped,
+                "M":             M,
+                "W_rect":        W_rect,
+                "H_rect":        H_rect,
+                "method":        "perspective",
+                "box_quad_src":  ordered.tolist(),
+                "box_x":         box_x,
+                "box_y":         box_y,
+                "box_w":         box_w,
+                "box_h":         box_h,
+            }
+        except Exception as e:
+            print(f"  ⚠ 透视矫正异常，降级旋转矫正: {type(e).__name__}: {e}")
+
+    # ── 策略 2：minAreaRect 旋转矫正 ─────────────────────────────────────────
+    try:
+        scale = min(1.0, BOX_DETECT_MAX_SIDE / max(H_img, W_img))
+        dW, dH = max(1, int(W_img * scale)), max(1, int(H_img * scale))
+        img_small = cv2.resize(img_cv, (dW, dH), interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
+        filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+        edges = cv2.Canny(filtered, 20, 80)
+        kernel = np.ones((9, 9), np.uint8)
+        dilated = cv2.dilate(edges, kernel, iterations=3)
+        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            cnt = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(cnt) >= 0.08 * dW * dH:
+                rect = cv2.minAreaRect(cnt)
+                box_pts = cv2.boxPoints(rect).astype(np.float32)
+                # 还原到原图
+                box_pts_orig = box_pts / scale
+                ordered = _order_quad_corners(box_pts_orig)
+                tl, tr, br, bl = ordered
+                w_top    = float(np.linalg.norm(tr - tl))
+                w_bottom = float(np.linalg.norm(br - bl))
+                h_left   = float(np.linalg.norm(bl - tl))
+                h_right  = float(np.linalg.norm(br - tr))
+                W_rect = max(1, int(round(max(w_top, w_bottom))))
+                H_rect = max(1, int(round(max(h_left, h_right))))
+                clip_scale = min(1.0, BOX_DETECT_MAX_SIDE / max(W_rect, H_rect))
+                if clip_scale < 1.0:
+                    W_rect = max(1, int(round(W_rect * clip_scale)))
+                    H_rect = max(1, int(round(H_rect * clip_scale)))
+                dst = np.array([
+                    [0, 0], [W_rect - 1, 0],
+                    [W_rect - 1, H_rect - 1], [0, H_rect - 1],
+                ], dtype=np.float32)
+                M = cv2.getPerspectiveTransform(ordered, dst)
+                warped = cv2.warpPerspective(img_cv, M, (W_rect, H_rect))
+
+                xs = ordered[:, 0]; ys = ordered[:, 1]
+                box_x = int(max(0, np.floor(xs.min())))
+                box_y = int(max(0, np.floor(ys.min())))
+                box_w = int(min(W_img - box_x, np.ceil(xs.max()) - box_x))
+                box_h = int(min(H_img - box_y, np.ceil(ys.max()) - box_y))
+
+                return {
+                    "warped_img":    warped,
+                    "M":             M,
+                    "W_rect":        W_rect,
+                    "H_rect":        H_rect,
+                    "method":        "rotation",
+                    "box_quad_src":  ordered.tolist(),
+                    "box_x":         box_x,
+                    "box_y":         box_y,
+                    "box_w":         box_w,
+                    "box_h":         box_h,
+                }
+    except Exception as e:
+        print(f"  ⚠ 旋转矫正异常，降级轴对齐 bbox: {type(e).__name__}: {e}")
+
+    # ── 策略 3：轴对齐 bbox 兜底（复用 detect_box_bbox）────────────────────
+    bx, by, bw, bh, _method = detect_box_bbox(image_pil)
+    warped = img_cv[by:by + bh, bx:bx + bw].copy()
+    return {
+        "warped_img":    warped if warped.size > 0 else img_cv,
+        "M":             None,
+        "W_rect":        bw,
+        "H_rect":        bh,
+        "method":        "axis_aligned",
+        "box_quad_src":  None,
+        "box_x":         bx,
+        "box_y":         by,
+        "box_w":         bw,
+        "box_h":         bh,
+    }
+
+
+def transform_polys(polys_orig: list, M: np.ndarray | None,
+                    box_x: int = 0, box_y: int = 0) -> list:
+    """
+    将原图 OCR 多边形映射到矫正坐标系。
+      - M is not None：使用 cv2.perspectiveTransform（适用于 perspective / rotation）
+      - M is None    ：轴对齐兜底，简单平移 (box_x, box_y)
+    返回与输入同结构的 polys_rect。
+    """
+    if not polys_orig:
+        return []
+    out = []
+    if M is not None:
+        for poly in polys_orig:
+            try:
+                pts = np.array(poly, dtype=np.float32).reshape(-1, 1, 2)
+                warped = cv2.perspectiveTransform(pts, M).reshape(-1, 2)
+                out.append([[float(p[0]), float(p[1])] for p in warped])
+            except Exception:
+                out.append([[float(pt[0]), float(pt[1])] for pt in poly])
+    else:
+        for poly in polys_orig:
+            out.append([
+                [float(pt[0]) - box_x, float(pt[1]) - box_y] for pt in poly
+            ])
+    return out
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 五、贴纸定位与位置验证
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -375,129 +772,191 @@ def is_flat_sticker(
     return False, "未检测到端片文字（Authorized Reseller），贴纸未平铺"
 
 
-def detect_unofficial_sticker_color(
-    image_pil: Image.Image,
-    box_x: int, box_y: int, box_w: int, box_h: int,
+def _filter_color_candidates(
+    candidate_mask: np.ndarray,
+    signal_u8: np.ndarray,
+    zone_area: int,
+    color_cfg: dict,
+    detail_prefix: str,
 ) -> tuple[bool, str]:
     """
-    改进版：基于包装盒颜色归一化的非官方贴纸检测。
+    通用后段过滤：morphology → 连通区 → 面积占比 → 形状紧实度 → 边缘梯度。
+    白盒/棕盒两个分支共用此段，差异只在前段（候选掩码与参考信号）。
 
-    核心改进：
-      1. 白平衡归一化：采样包装盒高亮低饱和区域（真实白色背景），
-         估计全局光照/阴影引起的色偏，将整个区域饱和度减去该基准偏置，
-         消除门店灯光色偏、手部阴影等环境因素。
-      2. 形状紧实度（Solidity）过滤：真实贴纸是紧凑矩形块（Solidity > 0.45），
-         阴影/反光形状不规则，Solidity 低，可有效区分。
-      3. 边缘清晰度过滤：贴纸边缘饱和度梯度大（界限清晰），
-         阴影是渐变，梯度小，可进一步排除渐变色偏区域。
+    参数：
+      candidate_mask: uint8 0/255，候选异常像素掩码
+      signal_u8     : uint8，用于计算边缘梯度的单通道信号
+                      （白盒=归一化有效饱和度 eff_sat；棕盒=原始饱和度 s_raw）
+      zone_area     : int，检测区域总像素数
+      color_cfg     : 阈值配置（读取 area_ratio / solidity_min / edge_grad_min）
+      detail_prefix : 命中时详情文字前缀（用于区分分支来源）
+    """
+    area_ratio_min = float(color_cfg.get("area_ratio", 0.015))
+    solidity_min   = float(color_cfg.get("solidity_min", 0.45))
+    edge_grad_min  = float(color_cfg.get("edge_grad_min", 6.0))
 
-    检测区域：整个包装盒（内缩 2% 边距，排除盒子边框干扰）。
+    # 形态学去噪（合并相邻像素）
+    k5 = np.ones((5, 5), np.uint8)
+    mask = cv2.dilate(candidate_mask, k5, iterations=2)
+    mask = cv2.erode(mask, k5, iterations=2)
+
+    n_labels, label_img, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+    # 预计算边缘梯度图
+    gx = cv2.Sobel(signal_u8, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(signal_u8, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(gx ** 2 + gy ** 2)
+
+    for label in range(1, n_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        ratio = area / max(zone_area, 1)
+        if ratio < area_ratio_min:
+            continue
+
+        comp_mask = (label_img == label).astype(np.uint8)
+
+        contours, _ = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+        cnt = max(contours, key=cv2.contourArea)
+        hull = cv2.convexHull(cnt)
+        hull_area = cv2.contourArea(hull)
+        if hull_area < 1:
+            continue
+        solidity = cv2.contourArea(cnt) / hull_area
+        if solidity < solidity_min:
+            continue
+
+        # 连通区边缘像素环（膨胀 − 腐蚀）
+        k3 = np.ones((3, 3), np.uint8)
+        boundary = (cv2.dilate(comp_mask, k3) - cv2.erode(comp_mask, k3)).astype(bool)
+        mean_edge_grad = float(grad_mag[boundary].mean()) if boundary.any() else 0.0
+        if mean_edge_grad < edge_grad_min:
+            continue
+
+        return True, (
+            f"{detail_prefix}：色块面积占比 {ratio:.1%}，"
+            f"紧实度 {solidity:.2f}，边缘梯度 {mean_edge_grad:.1f}"
+        )
+
+    return False, ""
+
+
+def _detect_unofficial_white_box(zone: np.ndarray, color_cfg: dict) -> tuple[bool, str]:
+    """
+    白盒分支：白平衡归一化 + 相对饱和度。
+    原理：白背景 S≈0，任何彩色块都是饱和度显著升高的异常信号。
+    """
+    sat_above_bg = float(color_cfg.get("sat_above_bg", UNOFFICIAL_SAT_ABOVE_BG))
+    v_min, v_max = color_cfg.get("val_range", UNOFFICIAL_VAL_RANGE)
+
+    hsv_f = cv2.cvtColor(zone, cv2.COLOR_BGR2HSV).astype(np.float32)
+    s_raw = hsv_f[:, :, 1]
+    v_raw = hsv_f[:, :, 2]
+
+    # 高亮 + 低饱和像素 = 包装盒真实白色背景
+    white_mask = (v_raw > 180) & (s_raw < 55)
+    if white_mask.sum() > 200:
+        bg_sat_ref = float(np.percentile(s_raw[white_mask], 90))
+    else:
+        bg_sat_ref = 0.0
+
+    eff_sat = np.clip(s_raw - bg_sat_ref - 10.0, 0.0, 255.0)
+
+    candidate = (
+        (eff_sat > sat_above_bg) &
+        (v_raw > v_min) & (v_raw < v_max)
+    ).astype(np.uint8) * 255
+
+    eff_sat_u8 = np.clip(eff_sat, 0, 255).astype(np.uint8)
+    zone_area = zone.shape[0] * zone.shape[1]
+    prefix = f"[white_box] 检测到非白色彩色区域 (bg_ref S={bg_sat_ref:.1f})"
+    return _filter_color_candidates(candidate, eff_sat_u8, zone_area, color_cfg, prefix)
+
+
+def _detect_unofficial_brown_box(zone: np.ndarray, color_cfg: dict) -> tuple[bool, str]:
+    """
+    棕盒分支（Mac 专用）：排除棕色（盒面本身）+ 排除白色（官方白贴与强反光）
+    + 绝对饱和度阈值（无白参考，不用 sat_above_bg）。
+    等于「非棕 ∩ 非白 ∩ 高饱和」的异色候选区。
+    """
+    brown_h_lo, brown_h_hi = color_cfg.get("brown_hue_range", (5, 30))
+    brown_sat_min = float(color_cfg.get("brown_sat_min", 30))
+    brown_v_lo, brown_v_hi = color_cfg.get("brown_val_range", (40, 200))
+    white_sat_max = float(color_cfg.get("white_sat_max", 30))
+    white_val_min = float(color_cfg.get("white_val_min", 200))
+    sat_min_abs = float(color_cfg.get("sat_min_abs", 80))
+    v_min, v_max = color_cfg.get("val_range", (50, 240))
+
+    hsv_f = cv2.cvtColor(zone, cv2.COLOR_BGR2HSV).astype(np.float32)
+    h_raw = hsv_f[:, :, 0]   # OpenCV: 0~180
+    s_raw = hsv_f[:, :, 1]
+    v_raw = hsv_f[:, :, 2]
+
+    brown_mask = (
+        (h_raw >= brown_h_lo) & (h_raw <= brown_h_hi) &
+        (s_raw >= brown_sat_min) &
+        (v_raw >= brown_v_lo) & (v_raw <= brown_v_hi)
+    )
+    white_mask = (s_raw <= white_sat_max) & (v_raw >= white_val_min)
+
+    foreign = (
+        (~brown_mask) & (~white_mask) &
+        (s_raw >= sat_min_abs) &
+        (v_raw >= v_min) & (v_raw <= v_max)
+    ).astype(np.uint8) * 255
+
+    s_u8 = np.clip(s_raw, 0, 255).astype(np.uint8)
+    zone_area = zone.shape[0] * zone.shape[1]
+    prefix = "[brown_box] 检测到非棕非白高饱和异色区域"
+    return _filter_color_candidates(foreign, s_u8, zone_area, color_cfg, prefix)
+
+
+def detect_unofficial_sticker_color(
+    warped_img: np.ndarray,
+    color_cfg: dict,
+) -> tuple[bool, str]:
+    """
+    非官方贴纸颜色检测（按 LOB 配置分流白盒 / 棕盒两种模式）。
+
+    输入：
+      warped_img : rectify_package_box 返回的矫正后 BGR 图（或 axis_aligned 兜底时的盒内裁剪图）
+      color_cfg  : LOB_CONFIGS[lob]["unofficial_color"]，至少包含 enabled / mode
+
+    行为：
+      - enabled=False → 直接返回 (False, "跳过")
+      - mode=white_box → 白平衡归一化 + 相对饱和度阈值
+      - mode=brown_box → 排除棕 + 排除白 + 绝对饱和度阈值
+      命中阈值则返回 True（调用方将 position_valid 硬判为 4）。
 
     返回: (has_unofficial: bool, detail: str)
     """
+    if not color_cfg or not color_cfg.get("enabled", False):
+        return False, "颜色检测已跳过（当前 LOB 未启用）"
+
     try:
-        img_cv = pil_to_cv(image_pil)
+        if warped_img is None or warped_img.size == 0:
+            return False, ""
 
-        # 截取整个包装盒区域（内缩 2% 避免盒子边框色块干扰）
-        margin_x = max(1, int(box_w * 0.02))
-        margin_y = max(1, int(box_h * 0.02))
-        x1 = max(0, box_x + margin_x)
-        y1 = max(0, box_y + margin_y)
-        x2 = min(img_cv.shape[1], box_x + box_w - margin_x)
-        y2 = min(img_cv.shape[0], box_y + box_h - margin_y)
+        H, W = warped_img.shape[:2]
+        if H < 10 or W < 10:
+            return False, ""
 
-        zone = img_cv[y1:y2, x1:x2]
+        # 内缩 2% 去除盒子边框干扰
+        mx = max(1, int(W * 0.02))
+        my = max(1, int(H * 0.02))
+        zone = warped_img[my:H - my, mx:W - mx]
         if zone.shape[0] < 10 or zone.shape[1] < 10:
             return False, ""
 
-        # ── Step 1: 白平衡归一化 ──────────────────────────────────────────────
-        # 将包装盒区域转为 HSV，浮点以便后续运算
-        hsv_f = cv2.cvtColor(zone, cv2.COLOR_BGR2HSV).astype(np.float32)
-        s_raw = hsv_f[:, :, 1]   # 0~255
-        v_raw = hsv_f[:, :, 2]   # 0~255
+        mode = color_cfg.get("mode", "white_box")
+        if mode == "brown_box":
+            return _detect_unofficial_brown_box(zone, color_cfg)
+        # 默认白盒分支
+        return _detect_unofficial_white_box(zone, color_cfg)
 
-        # 高亮（V > 180）+ 低饱和（S < 55）的像素 = 包装盒真实白色背景
-        white_mask = (v_raw > 180) & (s_raw < 55)
-        if white_mask.sum() > 200:
-            # 取白色参考区域的 90th 百分位饱和度作为光照色偏基准
-            bg_sat_ref = float(np.percentile(s_raw[white_mask], 90))
-        else:
-            # 白色参考不足（深色盒子等特殊情况），不做归一化
-            bg_sat_ref = 0.0
-
-        # 有效饱和度 = 原始饱和度 − 背景基准（再减10点宽容量）
-        eff_sat = np.clip(s_raw - bg_sat_ref - 10.0, 0.0, 255.0)
-
-        # ── Step 2: 彩色像素掩码（归一化后） ────────────────────────────────
-        v_min, v_max = UNOFFICIAL_VAL_RANGE
-        color_mask = (
-            (eff_sat > UNOFFICIAL_SAT_ABOVE_BG) &
-            (v_raw > v_min) & (v_raw < v_max)
-        ).astype(np.uint8) * 255
-
-        # 形态学：合并相邻像素，消除噪点
-        k5 = np.ones((5, 5), np.uint8)
-        color_mask = cv2.dilate(color_mask, k5, iterations=2)
-        color_mask = cv2.erode(color_mask, k5, iterations=2)
-
-        # ── Step 3: 连通区分析 + 形状/边缘验证 ──────────────────────────────
-        n_labels, label_img, stats, _ = cv2.connectedComponentsWithStats(
-            color_mask, connectivity=8
-        )
-        zone_area = zone.shape[0] * zone.shape[1]
-
-        # 预计算归一化饱和度梯度图（用于边缘清晰度检测）
-        eff_sat_u8 = np.clip(eff_sat, 0, 255).astype(np.uint8)
-        gx = cv2.Sobel(eff_sat_u8, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(eff_sat_u8, cv2.CV_32F, 0, 1, ksize=3)
-        grad_mag = np.sqrt(gx ** 2 + gy ** 2)
-
-        for label in range(1, n_labels):   # 跳过背景(0)
-            area = int(stats[label, cv2.CC_STAT_AREA])
-            ratio = area / max(zone_area, 1)
-            if ratio < UNOFFICIAL_AREA_RATIO:
-                continue
-
-            comp_mask = (label_img == label).astype(np.uint8)
-
-            # ── 形状紧实度（Solidity）────────────────────────────────────────
-            # 贴纸是紧凑矩形，Solidity 高；阴影轮廓不规则，Solidity 低
-            contours, _ = cv2.findContours(
-                comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-            if not contours:
-                continue
-            cnt = max(contours, key=cv2.contourArea)
-            hull = cv2.convexHull(cnt)
-            hull_area = cv2.contourArea(hull)
-            if hull_area < 1:
-                continue
-            solidity = cv2.contourArea(cnt) / hull_area
-
-            if solidity < UNOFFICIAL_SOLIDITY_MIN:
-                # 形状太不规则，判定为阴影/光照伪影，跳过
-                continue
-
-            # ── 边缘清晰度（饱和度梯度） ─────────────────────────────────────
-            # 提取连通区边界像素环（膨胀 − 腐蚀）
-            k3 = np.ones((3, 3), np.uint8)
-            boundary = (cv2.dilate(comp_mask, k3) - cv2.erode(comp_mask, k3)).astype(bool)
-            mean_edge_grad = float(grad_mag[boundary].mean()) if boundary.any() else 0.0
-
-            if mean_edge_grad < UNOFFICIAL_EDGE_GRAD_MIN:
-                # 边缘为渐变，判定为阴影/环境光色偏，跳过
-                continue
-
-            return True, (
-                f"包装盒内检测到非白色彩色区域"
-                f"（归一化有效饱和色块占盒内面积 {ratio:.1%}，"
-                f"紧实度 {solidity:.2f}，边缘梯度 {mean_edge_grad:.1f}，"
-                f"背景色偏基准 S={bg_sat_ref:.1f}，疑为经销商自贴）"
-            )
-
-        return False, ""
     except Exception as e:
-        return False, f"颜色检测异常: {type(e).__name__}"
+        return False, f"颜色检测异常: {type(e).__name__}: {e}"
 
 
 def find_all_scan_stickers(texts: list[str], polys: list) -> list[dict]:
@@ -552,29 +1011,35 @@ def has_dealer_only_sticker(texts: list[str]) -> tuple[bool, str]:
         return True, sample
     return False, ""
 
-def check_dual_sticker_status(texts: list[str], polys: list, img_h: int) -> dict:
+def check_dual_sticker_status(
+    texts: list[str],
+    polys: list,
+    img_h: int,
+    sticker_count_mode: str = "single_or_dual",
+) -> dict:
     """
-    检测双贴纸状态（单图内）。
+    检测双贴纸状态（单图内），按 LOB 的 sticker_count 约定分流。
 
-    规范说明：
-      单贴场景：只有一张"扫码即领"贴纸                     → dual_code=0
-      双贴合规：一张"扫码即领" + 一张"Apple授权专营店"      → dual_code=1
-      双贴错误：两张"扫码即领"（上下均为扫码贴）            → dual_code=2
+    sticker_count_mode:
+      - "single_only"    : 仅单贴（AirPods/Accy.）。不允许两张扫码贴；忽略 Auth 贴纸。
+      - "single_or_dual" : 单/双贴均可（iPhone/Watch/iPad/Mac）。当前行为。
+      - "dual_required"  : 必须双贴（保留扩展口径）。缺 Auth 记 dual_code=3。
 
-    返回 dict:
-      scan_count  : int  ── 独立"扫码即领"贴纸数量（按 Y 坐标聚类）
-      has_auth    : bool ── 是否检测到"Apple授权专营店"贴纸
-      dual_code   : int  ── 0=单贴 | 1=双贴合规 | 2=双贴错误
-      dual_detail : str
+    dual_code 编码（保持向下兼容）：
+       0 = 单贴
+       1 = 双贴合规（扫码 + 授权专营店）
+       2 = 双贴错误（两张扫码）
+       3 = 缺失二贴（dual_required 且未找到 Auth）
+      -1 = 未找到扫码贴
     """
     scan_stickers = find_all_scan_stickers(texts, polys)
-    has_auth = any(
+    has_auth_raw = any(
         kw in text
         for text in texts
         for kw in ["Apple授权专营店", "授权专营店", "在你身边"]
     )
 
-    # 通过 Y 坐标聚类统计独立贴纸数（Y 差 > 图片高度20% 视为不同贴纸）
+    # 按 Y 坐标聚类统计独立贴纸数
     MIN_Y_GAP = max(img_h * 0.20, 50)
     distinct: list[dict] = []
     for s in scan_stickers:
@@ -582,22 +1047,59 @@ def check_dual_sticker_status(texts: list[str], polys: list, img_h: int) -> dict
             distinct.append(s)
     scan_count = len(distinct)
 
+    if sticker_count_mode == "single_only":
+        # 仅单贴：忽略 Auth 贴纸；出现两张扫码仍然不合规
+        has_auth = False
+        if scan_count >= 2:
+            dual_code, dual_detail = 2, (
+                f"错误：检测到{scan_count}个'扫码即领'贴纸（该 LOB 仅允许单贴）"
+            )
+        elif scan_count == 1:
+            dual_code, dual_detail = 0, "单贴：仅'扫码即领'（已忽略 Auth 关键词）"
+        else:
+            dual_code, dual_detail = -1, "未找到'扫码即领'贴纸"
+        return {
+            "scan_count":  scan_count,
+            "has_auth":    has_auth,
+            "dual_code":   dual_code,
+            "dual_detail": dual_detail,
+        }
+
+    if sticker_count_mode == "dual_required":
+        if scan_count >= 2:
+            dual_code, dual_detail = 2, (
+                f"错误：检测到{scan_count}个'扫码即领'贴纸，上下均为扫码贴"
+            )
+        elif scan_count == 1 and has_auth_raw:
+            dual_code, dual_detail = 1, "合规双贴：'扫码即领' + 'Apple授权专营店'"
+        elif scan_count == 1:
+            dual_code, dual_detail = 3, (
+                "缺失二贴：该 LOB 规定必须双贴，但未检测到'Apple授权专营店'"
+            )
+        else:
+            dual_code, dual_detail = -1, "未找到'扫码即领'贴纸"
+        return {
+            "scan_count":  scan_count,
+            "has_auth":    has_auth_raw,
+            "dual_code":   dual_code,
+            "dual_detail": dual_detail,
+        }
+
+    # 默认 single_or_dual（现行行为）
     if scan_count >= 2:
-        dual_code   = 2
-        dual_detail = f"错误：检测到{scan_count}个'扫码即领'贴纸，上下均为扫码贴"
-    elif scan_count == 1 and has_auth:
-        dual_code   = 1
-        dual_detail = "合规双贴：'扫码即领' + 'Apple授权专营店'"
+        dual_code, dual_detail = 2, (
+            f"错误：检测到{scan_count}个'扫码即领'贴纸，上下均为扫码贴"
+        )
+    elif scan_count == 1 and has_auth_raw:
+        dual_code, dual_detail = 1, "合规双贴：'扫码即领' + 'Apple授权专营店'"
     elif scan_count == 1:
-        dual_code   = 0
-        dual_detail = "单贴：仅'扫码即领'"
+        dual_code, dual_detail = 0, "单贴：仅'扫码即领'"
     else:
-        dual_code   = -1
-        dual_detail = "未找到'扫码即领'贴纸"
+        dual_code, dual_detail = -1, "未找到'扫码即领'贴纸"
 
     return {
         "scan_count":  scan_count,
-        "has_auth":    has_auth,
+        "has_auth":    has_auth_raw,
         "dual_code":   dual_code,
         "dual_detail": dual_detail,
     }
@@ -611,30 +1113,29 @@ def find_sticker_from_ocr(texts: list[str], polys: list) -> dict | None:
 
 def find_all_auth_stickers_in_box(
     texts: list[str],
-    polys: list,
-    box_x: int,
-    box_y: int,
-    box_w: int,
-    box_h: int,
+    polys_rect: list,
+    W_rect: int = 0,
+    H_rect: int = 0,
 ) -> list[dict]:
     """
-    返回所有中心点落在包装盒范围内的"Apple授权专营店"候选文字框列表。
+    返回所有中心点落在包装盒范围内（矫正坐标系 0~W_rect × 0~H_rect）
+    的"Apple授权专营店"候选文字框列表。
 
     匹配关键词：'Apple授权专营店' / '授权专营店' / '在你身边'
     盒子外部（如桌面、背景、包装印刷）的同名文字会被过滤掉。
     """
     AUTH_KW = ["Apple授权专营店", "授权专营店", "在你身边"]
     results = []
-    use_box_filter = box_w > 0 and box_h > 0
+    use_box_filter = W_rect > 0 and H_rect > 0
     for i, text in enumerate(texts):
-        if any(kw in text for kw in AUTH_KW) and i < len(polys):
+        if any(kw in text for kw in AUTH_KW) and i < len(polys_rect):
             try:
-                poly = np.array(polys[i], dtype=float)
+                poly = np.array(polys_rect[i], dtype=float)
                 x1, y1 = float(poly[:, 0].min()), float(poly[:, 1].min())
                 x2, y2 = float(poly[:, 0].max()), float(poly[:, 1].max())
                 cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
                 if use_box_filter:
-                    if not (box_x <= cx <= box_x + box_w and box_y <= cy <= box_y + box_h):
+                    if not (0 <= cx <= W_rect and 0 <= cy <= H_rect):
                         continue
                 results.append({
                     "cx": cx, "cy": cy,
@@ -647,40 +1148,103 @@ def find_all_auth_stickers_in_box(
     return results
 
 
-# 保留旧名兼容内部调用（check_dual_sticker_status 里的全局 has_auth 检测）
 def find_auth_sticker_from_ocr(
     texts: list[str],
-    polys: list,
-    box_x: int = 0,
-    box_y: int = 0,
-    box_w: int = 0,
-    box_h: int = 0,
+    polys_rect: list,
+    W_rect: int = 0,
+    H_rect: int = 0,
 ) -> dict | None:
     """返回盒子内第一个命中的 Auth 贴纸候选（兼容旧调用）。"""
-    candidates = find_all_auth_stickers_in_box(texts, polys, box_x, box_y, box_w, box_h)
+    candidates = find_all_auth_stickers_in_box(texts, polys_rect, W_rect, H_rect)
     return candidates[0] if candidates else None
 
 
-def check_auth_sticker_position(
-    texts: list[str], polys: list,
-    box_x: int, box_y: int, box_w: int, box_h: int,
+def validate_sticker_position(
+    rel_cx: float,
+    rel_cy: float,
+    position_cfg: dict,
 ) -> dict:
     """
-    验证"Apple授权专营店"贴纸是否在规范位置（底部区域）。
+    验证已归一化的相对坐标是否满足规范位置（纯函数，无包装盒耦合）。
 
-    规范：rel_x ∈ [AUTH_X_MIN, AUTH_X_MAX]
-          rel_y ∈ [AUTH_Y_MIN, AUTH_Y_MAX]（底部 30%，即从上往下 70%~100%）
-
-    盒子内可能存在多个命中项（贴纸本身 + 盒面印刷文字），
-    只要任意一个满足位置条件即视为合规，以避免"先遇到印刷文字"的误判。
+    position_cfg 结构：{"x_min", "x_max", "y_min", "y_max"}
+    业务约定：
+      - x 双侧硬约束： x_min <= rel_x <= x_max
+      - y 在字段名上提供 y_min/y_max，以双侧约束判定（与历史"仅上限"略有差异，
+        但配合矫正坐标系更直观；上下界若任何一侧为 None 则视为不约束）
 
     返回 dict:
-      found              : bool  ── 盒子内是否找到任意候选项
-      in_correct_position: bool
-      rel_x, rel_y       : float | None  ── 第一个合规候选的坐标（无合规则为第一个候选）
-      detail             : str
+      in_correct_position : bool
+      rel_x, rel_y        : 相对坐标（四舍五入）
+      x_ok, y_ok          : 各轴是否达标
+      detail              : 文字说明
     """
-    candidates = find_all_auth_stickers_in_box(texts, polys, box_x, box_y, box_w, box_h)
+    if position_cfg is None:
+        return {
+            "in_correct_position": False,
+            "rel_x": round(rel_cx, 4) if rel_cx is not None else None,
+            "rel_y": round(rel_cy, 4) if rel_cy is not None else None,
+            "x_ok": False, "y_ok": False,
+            "detail": "位置验证跳过（该 LOB 未配置规范位置）",
+        }
+
+    x_min = position_cfg.get("x_min", -float("inf"))
+    x_max = position_cfg.get("x_max", float("inf"))
+    y_min = position_cfg.get("y_min", -float("inf"))
+    y_max = position_cfg.get("y_max", float("inf"))
+
+    x_ok = x_min <= rel_cx <= x_max
+    y_ok = y_min <= rel_cy <= y_max
+
+    if x_ok and y_ok:
+        detail = f"位置规范 (rel_x={rel_cx:.3f}, rel_y={rel_cy:.3f})"
+    else:
+        parts = []
+        if not x_ok:
+            parts.append(f"X={rel_cx:.3f} 不在 [{x_min},{x_max}]")
+        if not y_ok:
+            parts.append(f"Y={rel_cy:.3f} 不在 [{y_min},{y_max}]")
+        detail = "位置异常：" + "；".join(parts)
+
+    return {
+        "in_correct_position": x_ok and y_ok,
+        "rel_x": round(rel_cx, 4),
+        "rel_y": round(rel_cy, 4),
+        "x_ok": x_ok,
+        "y_ok": y_ok,
+        "detail": detail,
+    }
+
+
+def check_auth_sticker_position(
+    texts: list[str],
+    polys_rect: list,
+    W_rect: int,
+    H_rect: int,
+    position_cfg: dict,
+) -> dict:
+    """
+    验证"Apple 授权专营店"贴纸是否在规范位置（矫正坐标系）。
+
+    盒内可能出现多个命中（贴纸本身 + 盒面印刷文字），
+    只要任意一个满足 position_cfg 即视为合规，以避免"先遇到印刷文字"的误判。
+
+    参数：
+      polys_rect   : 已变换到矫正坐标系的 OCR 多边形（与 texts 对齐索引）
+      W_rect, H_rect : 矫正后包装盒尺寸（用于 rel 归一化 + 盒内过滤）
+      position_cfg : LOB_CONFIGS[lob]["auth_sticker"]，None 表示该 LOB 无二贴规范
+
+    返回 dict: found / in_correct_position / rel_x / rel_y / detail
+    """
+    if position_cfg is None:
+        return {
+            "found": False,
+            "in_correct_position": False,
+            "rel_x": None, "rel_y": None,
+            "detail": "该 LOB 无二贴规范",
+        }
+
+    candidates = find_all_auth_stickers_in_box(texts, polys_rect, W_rect, H_rect)
     if not candidates:
         return {
             "found": False,
@@ -689,81 +1253,32 @@ def check_auth_sticker_position(
             "detail": "未找到'Apple授权专营店'贴纸（盒子内）",
         }
 
-    # 遍历所有候选，任意一个满足位置条件即合规
-    first_candidate_rel = None
+    first_rel = None
+    first_detail = ""
     for auth in candidates:
-        rel_x = (auth["cx"] - box_x) / box_w if box_w > 0 else -1.0
-        rel_y = (auth["cy"] - box_y) / box_h if box_h > 0 else -1.0
-        if first_candidate_rel is None:
-            first_candidate_rel = (rel_x, rel_y)
-        x_ok = AUTH_X_MIN <= rel_x <= AUTH_X_MAX
-        y_ok = AUTH_Y_MIN <= rel_y <= AUTH_Y_MAX
-        if x_ok and y_ok:
+        rel_x = auth["cx"] / W_rect if W_rect > 0 else -1.0
+        rel_y = auth["cy"] / H_rect if H_rect > 0 else -1.0
+        v = validate_sticker_position(rel_x, rel_y, position_cfg)
+        if first_rel is None:
+            first_rel = (v["rel_x"], v["rel_y"])
+            first_detail = v["detail"]
+        if v["in_correct_position"]:
             return {
                 "found": True,
                 "in_correct_position": True,
-                "rel_x": round(rel_x, 4),
-                "rel_y": round(rel_y, 4),
-                "detail": f"Apple授权专营店位置规范 (rel_x={rel_x:.3f}, rel_y={rel_y:.3f})",
+                "rel_x": v["rel_x"],
+                "rel_y": v["rel_y"],
+                "detail": "Apple授权专营店位置规范 "
+                          f"(rel_x={v['rel_x']:.3f}, rel_y={v['rel_y']:.3f})",
             }
 
-    # 所有候选均不合规，报告第一个候选的坐标
-    rel_x, rel_y = first_candidate_rel
-    parts = []
-    if not (AUTH_X_MIN <= rel_x <= AUTH_X_MAX):
-        parts.append(f"X={rel_x:.3f} 不在 [{AUTH_X_MIN},{AUTH_X_MAX}]")
-    if not (AUTH_Y_MIN <= rel_y <= AUTH_Y_MAX):
-        parts.append(f"Y={rel_y:.3f} 不在 [{AUTH_Y_MIN},{AUTH_Y_MAX}]（底部30%）")
+    rel_x, rel_y = first_rel
     return {
         "found": True,
         "in_correct_position": False,
-        "rel_x": round(rel_x, 4),
-        "rel_y": round(rel_y, 4),
-        "detail": "Apple授权专营店位置异常：" + "；".join(parts),
-    }
-
-
-def validate_sticker_position(
-    sticker: dict,
-    box_x: int, box_y: int, box_w: int, box_h: int
-) -> dict:
-    """
-    将贴纸中心转换为包装盒相对坐标系，验证是否在规范位置。
-
-    返回 dict:
-      in_correct_position : bool
-      rel_x, rel_y        : 相对坐标（0.0~1.0；超界则 <0 或 >1）
-      x_ok, y_ok          : 各轴是否达标
-      detail              : 文字说明
-    """
-    rel_x = (sticker["cx"] - box_x) / box_w if box_w > 0 else -1.0
-    rel_y = (sticker["cy"] - box_y) / box_h if box_h > 0 else -1.0
-
-    x_ok = STICKER_X_MIN <= rel_x <= STICKER_X_MAX
-    # 业务更新：Y 仅做上限约束（rel_y <= 0.30）
-    y_ok = rel_y <= STICKER_Y_MAX
-
-    if x_ok and y_ok:
-        detail = f"位置规范 (rel_x={rel_x:.3f}, rel_y={rel_y:.3f})"
-    else:
-        parts = []
-        if not x_ok:
-            parts.append(
-                f"X={rel_x:.3f} 不在 [{STICKER_X_MIN},{STICKER_X_MAX}]"
-            )
-        if not y_ok:
-            parts.append(
-                f"Y={rel_y:.3f} 超过上限 {STICKER_Y_MAX}"
-            )
-        detail = "位置异常：" + "；".join(parts)
-
-    return {
-        "in_correct_position": x_ok and y_ok,
-        "rel_x": round(rel_x, 4),
-        "rel_y": round(rel_y, 4),
-        "x_ok": x_ok,
-        "y_ok": y_ok,
-        "detail": detail,
+        "rel_x": rel_x,
+        "rel_y": rel_y,
+        "detail": "Apple授权专营店" + first_detail,
     }
 
 
@@ -848,18 +1363,23 @@ def validate_angle(
 
 
 def check_sticker_placement(
-    sticker: dict,
-    box_x: int, box_y: int, box_w: int, box_h: int,
-    box_method: str,
+    sticker_rect: dict,
+    W_rect: int,
+    H_rect: int,
+    rectify_method: str,
     texts: list[str],
-    polys: list,
+    polys_rect: list,
+    scan_position_cfg: dict,
 ) -> dict:
     """
-    对单张候选图的"扫码即领"贴纸做合规检测。
+    对单张候选图的"扫码即领"贴纸做合规检测（矫正坐标系 + LOB 配置驱动）。
 
-    调用前提：
-      - sticker 已由 find_sticker_from_ocr() 定位（不为 None）
-      - box_x/y/w/h 已由 detect_box_bbox() 计算（非 fallback）
+    参数：
+      sticker_rect     : find_sticker_from_ocr(polys_rect) 定位的贴纸中心（矫正坐标）
+      W_rect, H_rect   : 矫正后包装盒尺寸
+      rectify_method   : "perspective" / "rotation" / "axis_aligned"（诊断用）
+      polys_rect       : 已映射到矫正坐标系的 OCR 多边形
+      scan_position_cfg: LOB_CONFIGS[lob]["scan_sticker"]
 
     检测顺序：
       Step 1  位置验证  → 不合规（0）立即返回
@@ -872,39 +1392,44 @@ def check_sticker_placement(
       angle_deg      : 贴纸偏角（度）；None 表示跳过
       detail         : 文字说明
     """
+    rel_x = sticker_rect["cx"] / W_rect if W_rect > 0 else -1.0
+    rel_y = sticker_rect["cy"] / H_rect if H_rect > 0 else -1.0
+
     # ── Step 1：位置验证 ──────────────────────────────────────────────────────
-    pos = validate_sticker_position(sticker, box_x, box_y, box_w, box_h)
+    pos = validate_sticker_position(rel_x, rel_y, scan_position_cfg)
     if not pos["in_correct_position"]:
         return {
             "position_valid": 0,
             "rel_x": pos["rel_x"],
             "rel_y": pos["rel_y"],
             "angle_deg": None,
-            "detail": f"[{box_method}] {pos['detail']}",
+            "detail": f"[{rectify_method}] {pos['detail']}",
         }
 
     # ── Step 2：角度验证（位置合规后才执行）─────────────────────────────────
-    # 正向完整照片（Phase 1 已过滤）包装盒水平边近似水平，故 box_angle=0
-    angle_ok, delta_deg, angle_detail = validate_angle(sticker, polys)
+    # 矫正后包装盒水平边位于 y=0 / y=H_rect，box_angle=0 由构造保证
+    angle_ok, delta_deg, angle_detail = validate_angle(sticker_rect, polys_rect)
     if not angle_ok:
         return {
             "position_valid": 3,
             "rel_x": pos["rel_x"],
             "rel_y": pos["rel_y"],
             "angle_deg": delta_deg,
-            "detail": f"[{box_method}] {angle_detail}",
+            "detail": f"[{rectify_method}] {angle_detail}",
         }
 
     # ── Step 3：平铺错误检测（位置 + 角度均合规后才执行）────────────────────
-    flat, flat_detail = is_flat_sticker(texts, polys, sticker["text_idx"],
-                                        box_x, box_y, box_w, box_h)
+    flat, flat_detail = is_flat_sticker(
+        texts, polys_rect, sticker_rect["text_idx"],
+        0, 0, W_rect, H_rect,
+    )
     if flat:
         return {
             "position_valid": 2,
             "rel_x": pos["rel_x"],
             "rel_y": pos["rel_y"],
             "angle_deg": delta_deg,
-            "detail": f"[{box_method}] {flat_detail}",
+            "detail": f"[{rectify_method}] {flat_detail}",
         }
 
     return {
@@ -912,7 +1437,7 @@ def check_sticker_placement(
         "rel_x": pos["rel_x"],
         "rel_y": pos["rel_y"],
         "angle_deg": delta_deg,
-        "detail": f"[{box_method}] {pos['detail']}",
+        "detail": f"[{rectify_method}] {pos['detail']}",
     }
 
 
@@ -998,21 +1523,31 @@ def _make_result(is_compliant, seal_exists, position_valid,
                  rel_x, rel_y, box_method, detail,
                  dual_code, dual_detail,
                  watermark_time, watermark_location,
-                 sticker_angle=None) -> dict:
+                 sticker_angle=None,
+                 lob: str = "",
+                 rectify_method: str = "",
+                 box_quad_src=None,
+                 unofficial_color_checked: int = 0,
+                 unofficial_color_mode: str = "") -> dict:
     """构造统一的返回 dict（避免各处重复写键名）。"""
     return {
-        "is_compliant":        is_compliant,
-        "seal_exists":         seal_exists,
-        "position_valid":      position_valid,
-        "rel_x":               rel_x,
-        "rel_y":               rel_y,
-        "sticker_angle":       sticker_angle,   # 贴纸偏角（°），None=跳过/不可用
-        "box_method":          box_method,
-        "detail":              detail,
-        "dual_code":           dual_code,
-        "dual_detail":         dual_detail,
-        "watermark_time":      watermark_time,
-        "watermark_location":  watermark_location,
+        "is_compliant":             is_compliant,
+        "seal_exists":              seal_exists,
+        "position_valid":           position_valid,
+        "rel_x":                    rel_x,
+        "rel_y":                    rel_y,
+        "sticker_angle":            sticker_angle,
+        "box_method":               box_method,
+        "detail":                   detail,
+        "dual_code":                dual_code,
+        "dual_detail":              dual_detail,
+        "watermark_time":           watermark_time,
+        "watermark_location":       watermark_location,
+        "lob":                      lob,
+        "rectify_method":           rectify_method,
+        "box_quad_src":             box_quad_src,
+        "unofficial_color_checked": unofficial_color_checked,
+        "unofficial_color_mode":    unofficial_color_mode,
     }
 
 
@@ -1020,36 +1555,50 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
     """
     处理单行订单（1~4 张图片），返回合规判定结果。
 
-    新流程：
-      Phase 1  下载全部图片，对每张做 OCR + 包装盒检测
-               筛选"正向完整背面照片"候选：
-                 • 含"扫码即领"文字（确认为背面）
-                 • 包装盒检测成功（非 fallback）
-                 • 盒子面积 / 图片面积 ≥ BOX_FRONTAL_MIN_RATIO
-               无候选 → 整单不合格（is_compliant=0）
+    多 LOB 流程：
+      Phase 0  识别 LOB（Excel LOB 列优先 → 产品名关键词降级 → iPhone 兜底）
 
-      Phase 2  取盒子面积占比最大的候选图作为唯一检测对象
+      Phase 1  遍历全部图片
+                 • OCR
+                 • 包装盒检测（detect_box_bbox）→ 验证正向完整
+                 • 符合条件者记入 candidates
 
-      Phase 3  单贴检测（短路逻辑，不合格立即返回）
-               Step A  位置验证（先做）
-               Step B  平铺错误检测（位置合规才执行）
+      Phase 2  选盒子占比最大的候选；对其执行包装盒透视矫正
+                 rectify_package_box() → warped_img / M / W_rect×H_rect / method
+               将原图 OCR 多边形映射到矫正坐标系
 
-      Phase 4  双贴纸检测（仅单贴全部合格后进行）
-               • dual_code=2（双扫码）→ 不合格
-               • dual_code=1（有授权专营店贴纸）→ 验证第二张位置
-               • dual_code=0（单贴）→ 合格
+      Phase 3  单贴检测（以矫正坐标 + LOB 配置判定）
+               Step 0  非官方贴纸颜色检测（按 LOB mode 分流，enabled=False 时跳过）
+               Step A  位置验证
+               Step B  角度验证
+               Step C  平铺错误检测
 
-      返回 dict（含 is_compliant / seal_exists / position_valid 等，见 _make_result）
+      Phase 4  双贴纸检测（按 LOB sticker_count 与 auth_sticker 位置规范判定）
     """
     print(f"\n{'='*80}")
     print(f"处理第 {idx}/{total} 行 (订单号: {row.get('订单号', 'N/A')})")
     print('=' * 80)
 
+    # ═══ Phase 0：LOB 识别 ══════════════════════════════════════════════════════
+    lob = detect_lob(row)
+    if lob == UNRECOGNIZED_LOB:
+        # 无法识别时用 iPhone 规则兜底，但输出列保留 "无法识别"，方便后续人工复核
+        lob_cfg = LOB_CONFIGS[DEFAULT_LOB]
+        print(f"  LOB: {lob}（兜底规则: {DEFAULT_LOB}）")
+    else:
+        lob_cfg = LOB_CONFIGS[lob]
+        print(f"  LOB: {lob}  (sticker_count={lob_cfg['sticker_count']})")
+
+    scan_cfg     = lob_cfg["scan_sticker"]
+    auth_cfg     = lob_cfg.get("auth_sticker")
+    color_cfg    = lob_cfg.get("unofficial_color", {"enabled": False})
+    sc_mode      = lob_cfg.get("sticker_count", "single_or_dual")
+
     watermark_time, watermark_location = "", ""
     watermark_extracted = False
     tasks = prefetched_tasks if prefetched_tasks is not None else submit_row_downloads(row)
 
-    # ═══ Phase 1：遍历所有图片，筛选候选 ════════════════════════════════════════
+    # ═══ Phase 1：遍历所有图片，筛选候选 ═══════════════════════════════════════
     candidates: list[dict] = []
     dealer_only_hit = False
     dealer_only_text = ""
@@ -1063,7 +1612,6 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
         print(f"  图片尺寸: {image.size}")
         image_id = f"row{idx}_col{col_idx}"
 
-        # 水印只取第一张
         if not watermark_extracted:
             wm_time, wm_loc = extract_watermark_crop(image, image_id)
             watermark_time, watermark_location = wm_time, wm_loc
@@ -1071,11 +1619,9 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
             print(f"  水印时间: {wm_time or '(未识别)'}")
             print(f"  水印地点: {wm_loc or '(未识别)'}")
 
-        # OCR
         full_text, texts, polys_orig, orig_h, orig_w = ocr_image_full(image, image_id)
         print(f"  识别文字预览: {full_text[:120]}{'...' if len(full_text) > 120 else ''}")
 
-        # 快速筛选：必须含"扫码即领"（背面确认）
         if not any("扫码即领" in t for t in texts):
             dealer_only, hit_text = has_dealer_only_sticker(texts)
             if dealer_only and not dealer_only_hit:
@@ -1085,10 +1631,8 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
             print("  → 未检测到'扫码即领'，非背面图，跳过")
             continue
 
-        # 包装盒检测
         box_x, box_y, box_w, box_h, box_method = detect_box_bbox(image)
 
-        # 正向完整判断
         if box_method == "fallback":
             print(f"  → 包装盒检测失败（fallback），不视为正向完整照片，跳过")
             continue
@@ -1097,24 +1641,20 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
             print(f"  → 包装盒面积占比={box_ratio:.2f} < {BOX_FRONTAL_MIN_RATIO}，非完整照片，跳过")
             continue
 
-        # 经销商非官方贴纸颜色检测（在盒子下半部分检测高饱和彩色区域）
-        has_unoff, unoff_detail = detect_unofficial_sticker_color(
-            image, box_x, box_y, box_w, box_h
-        )
-        if has_unoff:
-            print(f"  ⚠ 颜色检测：{unoff_detail}")
-
         print(f"  → 候选图片 ✓  盒子占比={box_ratio:.2f}，方法={box_method}")
         candidates.append({
-            "texts": texts, "polys": polys_orig,
-            "orig_h": orig_h, "orig_w": orig_w,
-            "box_x": box_x, "box_y": box_y, "box_w": box_w, "box_h": box_h,
-            "box_method": box_method, "box_ratio": box_ratio,
-            "has_unofficial": has_unoff,
-            "unofficial_detail": unoff_detail,
+            "image":       image,
+            "texts":       texts,
+            "polys_orig":  polys_orig,
+            "orig_h":      orig_h,
+            "orig_w":      orig_w,
+            "box_x":       box_x, "box_y": box_y,
+            "box_w":       box_w, "box_h": box_h,
+            "box_method":  box_method,
+            "box_ratio":   box_ratio,
         })
 
-    # ═══ Phase 2：无候选 → 不合格 ════════════════════════════════════════════
+    # ═══ Phase 2：无候选 → 不合格 ═══════════════════════════════════════════
     if not candidates:
         if dealer_only_hit:
             result = _make_result(
@@ -1123,6 +1663,7 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
                 detail=f"检测到经销商自贴且无官方封口贴（关键词: {dealer_only_text[:50]}）",
                 dual_code=-1, dual_detail="跳过",
                 watermark_time=watermark_time, watermark_location=watermark_location,
+                lob=lob,
             )
             _print_summary(result)
             return result
@@ -1132,52 +1673,83 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
             detail="无正向完整包装盒背面照片（含'扫码即领'且盒子可见）",
             dual_code=-1, dual_detail="跳过",
             watermark_time=watermark_time, watermark_location=watermark_location,
+            lob=lob,
         )
         _print_summary(result)
         return result
 
-    # 取盒子占比最大的图片（最完整的正向拍摄）
     best = max(candidates, key=lambda c: c["box_ratio"])
     print(f"\n  ✓ 选定候选图：盒子占比={best['box_ratio']:.2f}，方法={best['box_method']}")
 
+    # ═══ Phase 2.5：包装盒透视矫正（只对 best 做一次）══════════════════════════
+    rectify = rectify_package_box(best["image"])
+    rect_method  = rectify["method"]
+    warped_img   = rectify["warped_img"]
+    M            = rectify["M"]
+    W_rect       = int(rectify["W_rect"])
+    H_rect       = int(rectify["H_rect"])
+    box_quad_src = rectify["box_quad_src"]
+    print(f"  矫正方式: {rect_method}  矫正尺寸: {W_rect}×{H_rect}")
+
+    # 将原图 OCR 多边形映射到矫正坐标系
+    polys_rect = transform_polys(
+        best["polys_orig"], M,
+        box_x=best["box_x"] if M is None else 0,
+        box_y=best["box_y"] if M is None else 0,
+    )
+
     # ═══ Phase 3：单贴检测 ════════════════════════════════════════════════════
 
-    # Step 0：非官方贴纸检测（颜色信号，优先判断）
-    if best.get("has_unofficial"):
-        result = _make_result(
-            is_compliant=0, seal_exists=1, position_valid=4,
-            rel_x=None, rel_y=None, box_method=best["box_method"],
-            detail=f"检测到疑似经销商非官方贴纸：{best['unofficial_detail']}",
-            dual_code=-1, dual_detail="跳过",
-            watermark_time=watermark_time, watermark_location=watermark_location,
-        )
-        _print_summary(result)
-        return result
+    # Step 0：非官方贴纸颜色检测（按 LOB 配置分流）
+    color_checked = 0
+    color_mode = ""
+    if color_cfg.get("enabled", False):
+        color_mode = color_cfg.get("mode", "white_box")
+        color_checked = 1
+        has_unoff, unoff_detail = detect_unofficial_sticker_color(warped_img, color_cfg)
+        if has_unoff:
+            print(f"  ⚠ 颜色检测命中：{unoff_detail}")
+            result = _make_result(
+                is_compliant=0, seal_exists=1, position_valid=4,
+                rel_x=None, rel_y=None, box_method=best["box_method"],
+                detail=f"检测到疑似经销商非官方贴纸：{unoff_detail}",
+                dual_code=-1, dual_detail="跳过",
+                watermark_time=watermark_time, watermark_location=watermark_location,
+                lob=lob, rectify_method=rect_method,
+                box_quad_src=box_quad_src,
+                unofficial_color_checked=1, unofficial_color_mode=color_mode,
+            )
+            _print_summary(result)
+            return result
+        else:
+            print(f"  颜色检测 ({color_mode})：未发现异色区域")
+    else:
+        print(f"  颜色检测：LOB={lob} 当前 enabled=False，跳过")
 
-    sticker = find_sticker_from_ocr(best["texts"], best["polys"])
-    if sticker is None:
-        # 保底处理（正常不会走到这里）
+    # 在矫正坐标系里定位扫码贴
+    sticker_rect = find_sticker_from_ocr(best["texts"], polys_rect)
+    if sticker_rect is None:
         result = _make_result(
             is_compliant=0, seal_exists=0, position_valid=-1,
             rel_x=None, rel_y=None, box_method=best["box_method"],
             detail="候选图OCR二次定位'扫码即领'失败",
             dual_code=-1, dual_detail="跳过",
             watermark_time=watermark_time, watermark_location=watermark_location,
+            lob=lob, rectify_method=rect_method, box_quad_src=box_quad_src,
+            unofficial_color_checked=color_checked, unofficial_color_mode=color_mode,
         )
         _print_summary(result)
         return result
 
-    # Step A：位置验证（先做，不合规立即返回）
+    # Step A/B/C：位置 + 角度 + 平铺
     placement = check_sticker_placement(
-        sticker,
-        best["box_x"], best["box_y"], best["box_w"], best["box_h"],
-        best["box_method"], best["texts"], best["polys"],
+        sticker_rect, W_rect, H_rect, rect_method,
+        best["texts"], polys_rect, scan_cfg,
     )
 
-    _angle = placement.get("angle_deg")   # 便于后续所有分支复用
+    _angle = placement.get("angle_deg")
 
     if placement["position_valid"] != 1:
-        # 位置异常(0) / 角度异常(3) / 平铺错误(2) → 不合格，跳过双贴检测
         result = _make_result(
             is_compliant=0, seal_exists=1,
             position_valid=placement["position_valid"],
@@ -1187,15 +1759,19 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
             dual_detail="单贴不合规，跳过双贴检测",
             watermark_time=watermark_time, watermark_location=watermark_location,
             sticker_angle=_angle,
+            lob=lob, rectify_method=rect_method, box_quad_src=box_quad_src,
+            unofficial_color_checked=color_checked, unofficial_color_mode=color_mode,
         )
         _print_summary(result)
         return result
 
     # ═══ Phase 4：双贴纸检测（单贴合规后进行）════════════════════════════════
-    dual = check_dual_sticker_status(best["texts"], best["polys"], best["orig_h"])
+    dual = check_dual_sticker_status(
+        best["texts"], polys_rect, H_rect if H_rect > 0 else best["orig_h"],
+        sticker_count_mode=sc_mode,
+    )
 
     if dual["dual_code"] == 2:
-        # 两张"扫码即领"贴纸 → 不合格
         result = _make_result(
             is_compliant=0, seal_exists=1, position_valid=1,
             rel_x=placement["rel_x"], rel_y=placement["rel_y"],
@@ -1203,21 +1779,35 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
             dual_code=2, dual_detail=dual["dual_detail"],
             watermark_time=watermark_time, watermark_location=watermark_location,
             sticker_angle=_angle,
+            lob=lob, rectify_method=rect_method, box_quad_src=box_quad_src,
+            unofficial_color_checked=color_checked, unofficial_color_mode=color_mode,
         )
         _print_summary(result)
         return result
 
-    if dual["has_auth"]:
-        # 存在"Apple授权专营店"关键词 → 验证其在盒子内的位置
-        # （过滤盒子外部包装印刷文字导致的误触发）
+    if dual["dual_code"] == 3:
+        # dual_required 且缺二贴 → 不合格
+        result = _make_result(
+            is_compliant=0, seal_exists=1, position_valid=1,
+            rel_x=placement["rel_x"], rel_y=placement["rel_y"],
+            box_method=best["box_method"], detail=placement["detail"],
+            dual_code=3, dual_detail=dual["dual_detail"],
+            watermark_time=watermark_time, watermark_location=watermark_location,
+            sticker_angle=_angle,
+            lob=lob, rectify_method=rect_method, box_quad_src=box_quad_src,
+            unofficial_color_checked=color_checked, unofficial_color_mode=color_mode,
+        )
+        _print_summary(result)
+        return result
+
+    # 有 Auth 关键词 且该 LOB 有 auth_sticker 规范 → 验证位置
+    if dual["has_auth"] and auth_cfg is not None:
         auth_pos = check_auth_sticker_position(
-            best["texts"], best["polys"],
-            best["box_x"], best["box_y"], best["box_w"], best["box_h"],
+            best["texts"], polys_rect, W_rect, H_rect, auth_cfg,
         )
         if not auth_pos["found"]:
-            # 关键词来自盒子外部，盒子范围内无 Auth 贴纸，视为单贴合规，
-            # 不从此 if 块 return，继续向下执行单贴合规逻辑
-            dual = {**dual, "dual_code": 0, "dual_detail": "单贴：'Apple授权专营店'在盒子外，忽略"}
+            dual = {**dual, "dual_code": 0,
+                    "dual_detail": "单贴：'Apple授权专营店'在盒子外，忽略"}
         elif not auth_pos["in_correct_position"]:
             result = _make_result(
                 is_compliant=0, seal_exists=1, position_valid=1,
@@ -1227,11 +1817,12 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
                 dual_detail=f"双贴第二张位置异常：{auth_pos['detail']}",
                 watermark_time=watermark_time, watermark_location=watermark_location,
                 sticker_angle=_angle,
+                lob=lob, rectify_method=rect_method, box_quad_src=box_quad_src,
+                unofficial_color_checked=color_checked, unofficial_color_mode=color_mode,
             )
             _print_summary(result)
             return result
         else:
-            # 双贴且两张均合规
             result = _make_result(
                 is_compliant=1, seal_exists=1, position_valid=1,
                 rel_x=placement["rel_x"], rel_y=placement["rel_y"],
@@ -1239,11 +1830,13 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
                 dual_code=1, dual_detail=f"双贴合规：{auth_pos['detail']}",
                 watermark_time=watermark_time, watermark_location=watermark_location,
                 sticker_angle=_angle,
+                lob=lob, rectify_method=rect_method, box_quad_src=box_quad_src,
+                unofficial_color_checked=color_checked, unofficial_color_mode=color_mode,
             )
             _print_summary(result)
             return result
 
-    # 单贴，位置合规，无平铺 → 合规
+    # 单贴 / single_only 模式 → 合规
     result = _make_result(
         is_compliant=1, seal_exists=1, position_valid=1,
         rel_x=placement["rel_x"], rel_y=placement["rel_y"],
@@ -1251,6 +1844,8 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
         dual_code=dual["dual_code"], dual_detail=dual["dual_detail"],
         watermark_time=watermark_time, watermark_location=watermark_location,
         sticker_angle=_angle,
+        lob=lob, rectify_method=rect_method, box_quad_src=box_quad_src,
+        unofficial_color_checked=color_checked, unofficial_color_mode=color_mode,
     )
     _print_summary(result)
     return result
@@ -1258,12 +1853,14 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
 
 def _print_summary(r: dict):
     print(f"\n【结果汇总】")
+    print(f"  LOB           : {r.get('lob', '')}")
     print(f"  是否规范粘贴  : {'✓ 合规(1)' if r['is_compliant'] == 1 else '✗ 不合规(0)'}")
     print(f"  封口贴存在    : {r['seal_exists']}")
     print(f"  位置规范      : {r['position_valid']}")
     angle_str = f"{r['sticker_angle']:+.1f}°" if r.get('sticker_angle') is not None else "(未计算)"
     print(f"  贴纸相对X/Y   : {r['rel_x']} / {r['rel_y']}  偏角: {angle_str}")
-    print(f"  包装盒检测方式: {r['box_method']}")
+    print(f"  包装盒检测方式: {r['box_method']}  矫正方式: {r.get('rectify_method', '')}")
+    print(f"  颜色检测      : checked={r.get('unofficial_color_checked', 0)}  mode={r.get('unofficial_color_mode', '')}")
     print(f"  说明          : {r['detail']}")
     print(f"  双贴纸状态    : {r['dual_code']}  ({r['dual_detail']})")
     print(f"  水印时间      : {r['watermark_time'] or '(未识别)'}")
@@ -1281,15 +1878,20 @@ def main():
     output_excel = '/home/ubuntu/OCR/????? 件附件内容-0407-V2_processed.xlsx'
 
     NEW_COLS = [
+        '识别LOB',          # iPhone / Watch / AirPods / Accy. / iPad / Mac
         '是否规范粘贴',     # 0=不合规 | 1=合规  ← 总体判断，放最前
         '封口贴存在',       # 0 / 1
         '贴纸位置规范',     # -1=无贴纸 | 0=位置异常 | 1=位置规范 | 2=平铺错误 | 3=角度异常 | 4=非官方贴纸
-        '贴纸相对X',        # 0.0~1.0（相对包装盒宽度）
-        '贴纸相对Y',        # 0.0~1.0（相对包装盒高度）
+        '贴纸相对X',        # 0.0~1.0（相对包装盒宽度，矫正坐标系）
+        '贴纸相对Y',        # 0.0~1.0（相对包装盒高度，矫正坐标系）
         '贴纸角度',         # 贴纸长轴与包装盒水平方向的偏角（°）；空=未计算
         '包装盒检测方式',   # edge / bright / fallback
+        '矫正方式',         # perspective / rotation / axis_aligned
+        '包装盒四点坐标',   # 原图坐标系 4 角点 JSON（axis_aligned 时为空）
+        '颜色检测已执行',   # 0 / 1
+        '颜色检测模式',     # white_box / brown_box / 空
         '位置说明',         # 文字说明（含角度/位置/平铺详情）
-        '双贴纸状态',       # -1=无贴 | 0=单贴 | 1=双贴合规 | 2=双贴错误(两个扫码贴)
+        '双贴纸状态',       # -1=无贴 | 0=单贴 | 1=双贴合规 | 2=双贴错误 | 3=缺二贴(dual_required)
         '双贴纸说明',       # 文字说明
         '时间',
         '地点',
@@ -1341,6 +1943,7 @@ def main():
             r = process_row(row, idx + 1, total_rows, prefetched_tasks=tasks)
 
             result_row = row.to_dict()
+            result_row['识别LOB']        = r.get('lob', '')
             result_row['是否规范粘贴']   = r['is_compliant']
             result_row['封口贴存在']     = r['seal_exists']
             result_row['贴纸位置规范']   = r['position_valid']
@@ -1348,6 +1951,13 @@ def main():
             result_row['贴纸相对Y']      = r['rel_y'] if r['rel_y'] is not None else ''
             result_row['贴纸角度']       = r['sticker_angle'] if r.get('sticker_angle') is not None else ''
             result_row['包装盒检测方式'] = r['box_method'] if r['box_method'] else ''
+            result_row['矫正方式']       = r.get('rectify_method', '')
+            box_quad = r.get('box_quad_src')
+            result_row['包装盒四点坐标'] = (
+                json.dumps(box_quad, ensure_ascii=False) if box_quad else ''
+            )
+            result_row['颜色检测已执行'] = r.get('unofficial_color_checked', 0)
+            result_row['颜色检测模式']   = r.get('unofficial_color_mode', '')
             result_row['位置说明']       = r['detail']
             result_row['双贴纸状态']     = r['dual_code']
             result_row['双贴纸说明']     = r['dual_detail']
@@ -1390,20 +2000,28 @@ def main():
     def _cnt(col, val):
         return (df_final[col] == val).sum() if col in df_final.columns else 0
 
-    cnt_compliant  = _cnt('是否规范粘贴', 1)
-    cnt_fail       = _cnt('是否规范粘贴', 0)
-    cnt_seal       = _cnt('封口贴存在', 1)
-    cnt_no_seal    = _cnt('封口贴存在', 0)
-    cnt_pos_bad    = _cnt('贴纸位置规范', 0)
-    cnt_angle_bad  = _cnt('贴纸位置规范', 3)
-    cnt_flat       = _cnt('贴纸位置规范', 2)
-    cnt_no_frontal = _cnt('贴纸位置规范', -1)
-    cnt_unofficial = _cnt('贴纸位置规范', 4)
-    cnt_dual_ok    = _cnt('双贴纸状态', 1)
-    cnt_dual_err   = _cnt('双贴纸状态', 2)
+    cnt_compliant   = _cnt('是否规范粘贴', 1)
+    cnt_fail        = _cnt('是否规范粘贴', 0)
+    cnt_no_seal     = _cnt('封口贴存在', 0)
+    cnt_pos_bad     = _cnt('贴纸位置规范', 0)
+    cnt_angle_bad   = _cnt('贴纸位置规范', 3)
+    cnt_flat        = _cnt('贴纸位置规范', 2)
+    cnt_no_frontal  = _cnt('贴纸位置规范', -1)
+    cnt_unofficial  = _cnt('贴纸位置规范', 4)
+    cnt_dual_ok     = _cnt('双贴纸状态', 1)
+    cnt_dual_err    = _cnt('双贴纸状态', 2)
+    cnt_dual_miss   = _cnt('双贴纸状态', 3)
 
     print(f"\n{'='*80}")
     print(f"总共处理               : {total_rows} 行")
+    if '识别LOB' in df_final.columns:
+        print("LOB 分布:")
+        for lob_val, cnt in df_final['识别LOB'].value_counts(dropna=False).items():
+            print(f"  {lob_val}: {cnt}")
+    if '矫正方式' in df_final.columns:
+        print("矫正方式分布:")
+        for rm, cnt in df_final['矫正方式'].value_counts(dropna=False).items():
+            print(f"  {rm}: {cnt}")
     print(f"是否规范粘贴 ✓ 合规    : {cnt_compliant} 行")
     print(f"是否规范粘贴 ✗ 不合规  : {cnt_fail} 行")
     print(f"  ├─ 无正向完整照片    : {cnt_no_frontal} 行")
@@ -1412,7 +2030,8 @@ def main():
     print(f"  ├─ 角度异常          : {cnt_angle_bad} 行  (偏角 > {STICKER_ANGLE_MAX_DEG:.0f}°)")
     print(f"  ├─ 平铺错误          : {cnt_flat} 行  (端片未绕侧面)")
     print(f"  ├─ 非官方贴纸        : {cnt_unofficial} 行  (经销商彩色自贴)")
-    print(f"  └─ 双贴纸错误        : {cnt_dual_err} 行  (两个扫码贴)")
+    print(f"  ├─ 双贴纸错误        : {cnt_dual_err} 行  (两个扫码贴)")
+    print(f"  └─ 缺失二贴          : {cnt_dual_miss} 行  (dual_required)")
     print(f"双贴纸合规             : {cnt_dual_ok} 行  (扫码+授权专营)")
     print(f"总耗时                 : {(time.time() - start_time) / 3600:.2f} 小时")
     print(f"{'='*80}\n")

@@ -197,57 +197,35 @@ LOB_CONFIGS: dict[str, dict] = {
     },
 }
 
-# 无法识别 LOB 时使用的默认配置（iPhone 规则，向下兼容）
-DEFAULT_LOB = "iPhone"
-
-# 产品名/MPN 关键词降级匹配表（仅在 Excel LOB 列缺失或值异常时使用）
-_LOB_KEYWORDS: list[tuple[str, list[str]]] = [
-    ("iPhone",  ["iPhone", "iphone"]),
-    ("Watch",   ["Apple Watch", "AppleWatch", "Watch"]),
-    ("AirPods", ["AirPods", "airpods"]),
-    ("iPad",    ["iPad", "ipad"]),
-    ("Mac",     ["MacBook", "iMac", "Mac mini", "Mac Pro", "Mac Studio", "Mac"]),
-    ("Accy.",   ["Adapter", "Cable", "MagSafe", "Lightning", "USB-C Power",
-                 "充电器", "数据线", "保护壳", "配件"]),
-]
-
-UNRECOGNIZED_LOB = "无法识别"
+# 无法识别 LOB 时的输出字符串。
+# 说明：不再使用 iPhone 兜底 —— LOB 未知时直接判不合格，
+# 避免用错误规则跑出"看似正常"的 rel_x/rel_y，遮盖真实问题。
+UNRECOGNIZED_LOB = "UNKNOWN LOB"
 
 def detect_lob(row) -> str:
     """
     识别订单行对应的 LOB（产品线）。
 
-    优先级：
-      1. 直接读 row["LOB"]，与 LOB_CONFIGS key 精确匹配（strip）
-      2. 关键词匹配 row["平台对接码(MPN)"] / "品牌对接码(UPC)" / 订单描述
-      3. 任一路径均无法命中 → 返回 UNRECOGNIZED_LOB（"无法识别"）
+    权威来源：Excel 的 `LOB` 列（枚举：iPhone / Watch / AirPods / Accy. / iPad / Mac）。
+    为避免关键词降级里「门店名称包含 Mac/iPad 等字样」误匹配错误产品线，
+    本版本移除了 MPN / UPC / 门店名称的关键词降级路径。
 
-    返回值：LOB_CONFIGS 中的 key，或 "无法识别"（调用方负责兜底）。
+    返回值：
+      - 命中 LOB_CONFIGS key（精确匹配，strip 后比对）→ 返回该 key
+      - 其他任何情况（缺失 / NaN / 不在枚举内 / 异常）→ 返回 UNRECOGNIZED_LOB
+
+    调用方拿到 UNRECOGNIZED_LOB 时应直接跳过 OCR 流程、标记不合格，
+    不要再用 iPhone 规则兜底。
     """
     try:
         raw = row.get("LOB", None)
-        if raw is not None and not (isinstance(raw, float) and np.isnan(raw)):
-            key = str(raw).strip()
-            if key in LOB_CONFIGS:
-                return key
+        if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+            return UNRECOGNIZED_LOB
+        key = str(raw).strip()
+        if key in LOB_CONFIGS:
+            return key
     except Exception:
         pass
-
-    # 降级：关键词匹配 MPN / 产品描述相关列
-    candidates = []
-    for col in ("平台对接码(MPN)", "品牌对接码(UPC)", "门店名称"):
-        try:
-            v = row.get(col, "")
-            if v is not None and not (isinstance(v, float) and np.isnan(v)):
-                candidates.append(str(v))
-        except Exception:
-            continue
-    joined = " ".join(candidates)
-    if joined:
-        for lob_key, kws in _LOB_KEYWORDS:
-            if any(kw.lower() in joined.lower() for kw in kws):
-                return lob_key
-
     return UNRECOGNIZED_LOB
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -378,21 +356,35 @@ def ocr_image_full(image: Image.Image, image_id: str = "unknown"):
 # 四、包装盒检测（OpenCV，三级降级）
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def detect_box_bbox(image_pil: Image.Image) -> tuple[int, int, int, int, str]:
+# 棕色瓦楞纸盒 HSV 范围（适配 Mac 包装箱）
+# H: 5~30°（OpenCV 0~180 范围内的橙棕色带）
+# S: 30~200  避开纯灰 / 过饱和异常
+# V: 40~220  避开阴影与过曝
+BROWN_HSV_LOW  = (5,  30, 40)
+BROWN_HSV_HIGH = (30, 200, 220)
+
+
+def detect_box_bbox(
+    image_pil: Image.Image,
+    lob: str | None = None,
+) -> tuple[int, int, int, int, str]:
     """
     检测图片中产品包装盒的边界框。
 
     检测策略（按优先级降级）：
-      1. Canny 边缘 + 形态学膨胀 → 最大矩形轮廓（通用，适配各色包装）
-      2. 亮色区域阈值 → 最大外包矩形（适配 Apple 白色包装）
+      1. Canny 边缘 + 形态学膨胀 → 最大矩形轮廓（通用，不分 LOB）
+      2. 颜色区域阈值 → 最大外包矩形，按 LOB 分流：
+           lob == 'Mac'          → HSV 棕色范围（瓦楞纸盒）     method='brown'
+           其他（含 lob is None） → 灰度亮色阈值（白盒）          method='bright'
       3. 降级：返回整图区域（不丢数据，仍输出相对坐标供人工核查）
 
     参数:
-      image_pil: PIL Image，不缩放输入
+      image_pil : PIL Image，不缩放输入
+      lob       : LOB key；None 时按白盒处理（向下兼容旧调用）
     返回:
       (x, y, w, h, method_used)
-      - x, y, w, h 均为原图像素坐标
-      - method_used: 'edge' | 'bright' | 'fallback'
+      - x, y, w, h  均为原图像素坐标
+      - method_used : 'edge' | 'bright' | 'brown' | 'fallback'
     """
     img_cv = pil_to_cv(image_pil)
     H, W = img_cv.shape[:2]
@@ -409,7 +401,7 @@ def detect_box_bbox(image_pil: Image.Image) -> tuple[int, int, int, int, str]:
     MIN_AREA_RATIO = 0.08   # 包装盒至少占图像面积 8%
     MAX_ASPECT     = 5.0    # 宽高比不超过 5:1
 
-    # ── 策略 1：Canny 边缘检测 ──────────────────────────────────────────────
+    # ── 策略 1：Canny 边缘检测（通用，不分 LOB）─────────────────────────────
     edges = cv2.Canny(filtered, 20, 80)
     kernel = np.ones((9, 9), np.uint8)
     dilated = cv2.dilate(edges, kernel, iterations=3)
@@ -431,12 +423,26 @@ def detect_box_bbox(image_pil: Image.Image) -> tuple[int, int, int, int, str]:
                 'edge'
             )
 
-    # ── 策略 2：亮色区域（Apple 白色包装盒）───────────────────────────────
-    _, thresh = cv2.threshold(filtered, 190, 255, cv2.THRESH_BINARY)
-    # 去掉图像边界 1% 的高亮噪声
+    # ── 策略 2：颜色区域阈值（按 LOB 分流）─────────────────────────────────
+    if lob == "Mac":
+        hsv = cv2.cvtColor(img_small, cv2.COLOR_BGR2HSV)
+        thresh = cv2.inRange(hsv, np.array(BROWN_HSV_LOW, dtype=np.uint8),
+                                   np.array(BROWN_HSV_HIGH, dtype=np.uint8))
+        method_name = 'brown'
+    else:
+        _, thresh = cv2.threshold(filtered, 190, 255, cv2.THRESH_BINARY)
+        method_name = 'bright'
+
+    # 去掉图像边界 1% 的噪声（灯光反射 / 相机暗角）
     border = max(5, int(min(dW, dH) * 0.01))
     thresh[:border, :]  = 0;  thresh[-border:, :] = 0
     thresh[:, :border]  = 0;  thresh[:, -border:] = 0
+
+    # 棕盒走形态学闭运算 + 开运算消除瓦楞条纹空洞，白盒保持原逻辑（不做额外形态学）
+    if lob == "Mac":
+        k = np.ones((7, 7), np.uint8)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k, iterations=2)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN,  k, iterations=1)
 
     contours2, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours2 = sorted(contours2, key=cv2.contourArea, reverse=True)
@@ -450,7 +456,7 @@ def detect_box_bbox(image_pil: Image.Image) -> tuple[int, int, int, int, str]:
             return (
                 int(bx / scale), int(by / scale),
                 int(bw / scale), int(bh / scale),
-                'bright'
+                method_name
             )
 
     # ── 策略 3：降级，使用整图 ───────────────────────────────────────────────
@@ -525,7 +531,10 @@ def _find_box_quad(img_cv: np.ndarray) -> np.ndarray | None:
     return None
 
 
-def rectify_package_box(image_pil: Image.Image) -> dict:
+def rectify_package_box(
+    image_pil: Image.Image,
+    lob: str | None = None,
+) -> dict:
     """
     包装盒矫正（三级降级）：
         1) 四点透视矫正（perspective）：approxPolyDP 得到凸四边形 → warpPerspective
@@ -534,6 +543,11 @@ def rectify_package_box(image_pil: Image.Image) -> dict:
 
     OCR 仍在原图上跑，识别完成后通过返回的 `M` 把原图 OCR 多边形映射到矫正坐标系。
     矫正后坐标系中，包装盒覆盖 (0, 0) ~ (W_rect, H_rect)，贴纸相对坐标 = 除以 W_rect/H_rect。
+
+    参数：
+      image_pil : PIL Image
+      lob       : LOB key，用于 axis_aligned 兜底时选择白盒/棕盒阈值（见 detect_box_bbox）。
+                  策略 1/2 走纯边缘/minAreaRect，不分 LOB；策略 3 兜底才会用到 lob。
 
     返回 dict：
         warped_img:   np.ndarray  矫正后 BGR 图（axis_aligned 兜底时为裁剪后的 bbox 子图）
@@ -653,8 +667,8 @@ def rectify_package_box(image_pil: Image.Image) -> dict:
     except Exception as e:
         print(f"  ⚠ 旋转矫正异常，降级轴对齐 bbox: {type(e).__name__}: {e}")
 
-    # ── 策略 3：轴对齐 bbox 兜底（复用 detect_box_bbox）────────────────────
-    bx, by, bw, bh, _method = detect_box_bbox(image_pil)
+    # ── 策略 3：轴对齐 bbox 兜底（复用 detect_box_bbox，按 LOB 分流白/棕盒）────
+    bx, by, bw, bh, _method = detect_box_bbox(image_pil, lob=lob)
     warped = img_cv[by:by + bh, bx:bx + bw].copy()
     return {
         "warped_img":    warped if warped.size > 0 else img_cv,
@@ -1106,9 +1120,97 @@ def check_dual_sticker_status(
 
 
 def find_sticker_from_ocr(texts: list[str], polys: list) -> dict | None:
-    """返回第一个'扫码即领'文字框信息，找不到返回 None。"""
+    """
+    返回第一个'扫码即领'文字框信息，找不到返回 None。
+
+    注意：此函数仅为向下兼容保留（不再用于主贴选择）。
+    新主流程使用 pick_best_scan_sticker() 按 LOB 规范区域挑主贴，
+    避免"背景/印刷/多贴"时误取到 OCR 顺序靠前的非主贴。
+    """
     stickers = find_all_scan_stickers(texts, polys)
     return stickers[0] if stickers else None
+
+
+def _scan_sticker_distance_to_zone(
+    rel_x: float,
+    rel_y: float,
+    scan_position_cfg: dict,
+) -> float:
+    """
+    计算单个扫码贴（归一化相对坐标）到 LOB 规范矩形区域的距离。
+
+    约定（相对坐标系 0.0~1.0）：
+      - 贴纸落在 [x_min, x_max] × [y_min, y_max] 内 → 距离 0
+      - 落在区域外        → 距离 = 到最近边/角的欧氏距离（矩形外距离）
+
+    区域四个边界任意侧 cfg 缺失时按 ±∞ 处理（不约束该侧），
+    避免 None/缺省导致 TypeError。
+    """
+    if scan_position_cfg is None:
+        return float("inf")
+    x_min = scan_position_cfg.get("x_min", -float("inf"))
+    x_max = scan_position_cfg.get("x_max",  float("inf"))
+    y_min = scan_position_cfg.get("y_min", -float("inf"))
+    y_max = scan_position_cfg.get("y_max",  float("inf"))
+
+    dx = 0.0
+    if rel_x < x_min:
+        dx = x_min - rel_x
+    elif rel_x > x_max:
+        dx = rel_x - x_max
+
+    dy = 0.0
+    if rel_y < y_min:
+        dy = y_min - rel_y
+    elif rel_y > y_max:
+        dy = rel_y - y_max
+
+    return float((dx * dx + dy * dy) ** 0.5)
+
+
+def pick_best_scan_sticker(
+    scan_stickers: list[dict],
+    W_rect: int,
+    H_rect: int,
+    scan_position_cfg: dict,
+) -> dict | None:
+    """
+    从多个"扫码即领"候选中选择最可能是"主贴（封口贴）"的那一张。
+
+    为什么需要这一步：
+      实际订单场景存在一贴 / 二贴 / 多贴混合，OCR 返回顺序与位置
+      无关，若简单取 stickers[0] 很容易把背景/印刷/副贴当主贴，
+      导致位置验证 rel_x/rel_y 基于错误坐标而误判。
+
+    选贴策略（LOB-aware，规则由 scan_position_cfg 驱动）：
+      1) 把每个候选的 (cx, cy) 用矫正坐标 W_rect / H_rect 归一化成
+         (rel_x, rel_y)；
+      2) 计算 rel 点到该 LOB 规范区域的"外距离"
+         （落入区域内 → 0；落在外面 → 欧氏距离到区域边/角）；
+      3) 主贴 = 距离最小者；
+      4) 平手（同距离：常见于多张贴纸全部落在规范区域内）→
+         取 rel_y 较小者（更靠上/更靠规范锚点，对 iPhone/iPad/
+         AirPods/Accy. 符合"右上一定是太阳码贴"的业务共识）；
+         对底部贴纸 LOB（Mac：y_min=0.70）仍按 rel_y 最小排序
+         不会改变"已在区域内"的合规判定，因此不特别分支。
+
+    W_rect / H_rect <= 0 或 scan_position_cfg 为 None 时，
+    退化为返回 scan_stickers[0]（与旧行为一致）。
+
+    返回：被选中的 sticker dict，候选为空时返回 None。
+    """
+    if not scan_stickers:
+        return None
+    if scan_position_cfg is None or W_rect <= 0 or H_rect <= 0:
+        return scan_stickers[0]
+
+    def _key(s):
+        rel_x = s["cx"] / W_rect
+        rel_y = s["cy"] / H_rect
+        dist = _scan_sticker_distance_to_zone(rel_x, rel_y, scan_position_cfg)
+        return (dist, rel_y)
+
+    return min(scan_stickers, key=_key)
 
 
 def find_all_auth_stickers_in_box(
@@ -1375,7 +1477,8 @@ def check_sticker_placement(
     对单张候选图的"扫码即领"贴纸做合规检测（矫正坐标系 + LOB 配置驱动）。
 
     参数：
-      sticker_rect     : find_sticker_from_ocr(polys_rect) 定位的贴纸中心（矫正坐标）
+      sticker_rect     : pick_best_scan_sticker(polys_rect, ..., scan_cfg) 按 LOB
+                         规范区域筛选出的主贴中心（矫正坐标）
       W_rect, H_rect   : 矫正后包装盒尺寸
       rectify_method   : "perspective" / "rotation" / "axis_aligned"（诊断用）
       polys_rect       : 已映射到矫正坐标系的 OCR 多边形
@@ -1580,14 +1683,25 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
     print('=' * 80)
 
     # ═══ Phase 0：LOB 识别 ══════════════════════════════════════════════════════
+    # LOB 列缺失 / 不在枚举 → 直接标记不合格。
+    # 历史方案用 iPhone 规则兜底继续跑，会产出"看似正常"的 rel_x/rel_y，
+    # 反而遮盖 Excel 源数据质量问题，后续排查也无从下手。
     lob = detect_lob(row)
     if lob == UNRECOGNIZED_LOB:
-        # 无法识别时用 iPhone 规则兜底，但输出列保留 "无法识别"，方便后续人工复核
-        lob_cfg = LOB_CONFIGS[DEFAULT_LOB]
-        print(f"  LOB: {lob}（兜底规则: {DEFAULT_LOB}）")
-    else:
-        lob_cfg = LOB_CONFIGS[lob]
-        print(f"  LOB: {lob}  (sticker_count={lob_cfg['sticker_count']})")
+        print(f"  LOB: {lob} —— 跳过 OCR 检测，直接标记不合格")
+        result = _make_result(
+            is_compliant=0, seal_exists=0, position_valid=-1,
+            rel_x=None, rel_y=None, box_method=None,
+            detail=f"{UNRECOGNIZED_LOB}：Excel LOB 列缺失或不在枚举内，未执行 OCR 检测",
+            dual_code=-1, dual_detail="跳过",
+            watermark_time="", watermark_location="",
+            lob=lob,
+        )
+        _print_summary(result)
+        return result
+
+    lob_cfg = LOB_CONFIGS[lob]
+    print(f"  LOB: {lob}  (sticker_count={lob_cfg['sticker_count']})")
 
     scan_cfg     = lob_cfg["scan_sticker"]
     auth_cfg     = lob_cfg.get("auth_sticker")
@@ -1631,7 +1745,7 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
             print("  → 未检测到'扫码即领'，非背面图，跳过")
             continue
 
-        box_x, box_y, box_w, box_h, box_method = detect_box_bbox(image)
+        box_x, box_y, box_w, box_h, box_method = detect_box_bbox(image, lob=lob)
 
         if box_method == "fallback":
             print(f"  → 包装盒检测失败（fallback），不视为正向完整照片，跳过")
@@ -1681,8 +1795,8 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
     best = max(candidates, key=lambda c: c["box_ratio"])
     print(f"\n  ✓ 选定候选图：盒子占比={best['box_ratio']:.2f}，方法={best['box_method']}")
 
-    # ═══ Phase 2.5：包装盒透视矫正（只对 best 做一次）══════════════════════════
-    rectify = rectify_package_box(best["image"])
+    # ═══ Phase 2.5：包装盒透视矫正（只对 best 做一次，按 LOB 分流白/棕盒兜底）══════
+    rectify = rectify_package_box(best["image"], lob=lob)
     rect_method  = rectify["method"]
     warped_img   = rectify["warped_img"]
     M            = rectify["M"]
@@ -1726,8 +1840,17 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
     else:
         print(f"  颜色检测：LOB={lob} 当前 enabled=False，跳过")
 
-    # 在矫正坐标系里定位扫码贴
-    sticker_rect = find_sticker_from_ocr(best["texts"], polys_rect)
+    # 在矫正坐标系里定位扫码贴：
+    #   1) 找出所有 "扫码即领" 文字框（可能是多贴 / 背景 / 印刷重复）
+    #   2) 按 LOB 的 scan_sticker 规范区域挑距离最近的作为主贴，
+    #      避免 stickers[0] 顺序偏差带来的误判
+    scan_candidates = find_all_scan_stickers(best["texts"], polys_rect)
+    sticker_rect = pick_best_scan_sticker(
+        scan_candidates, W_rect, H_rect, scan_cfg,
+    )
+    if len(scan_candidates) > 1 and sticker_rect is not None:
+        print(f"  → '扫码即领'候选 {len(scan_candidates)} 个，"
+              f"按 LOB={lob} 规范区域选中 text_idx={sticker_rect['text_idx']}")
     if sticker_rect is None:
         result = _make_result(
             is_compliant=0, seal_exists=0, position_valid=-1,
@@ -1885,7 +2008,7 @@ def main():
         '贴纸相对X',        # 0.0~1.0（相对包装盒宽度，矫正坐标系）
         '贴纸相对Y',        # 0.0~1.0（相对包装盒高度，矫正坐标系）
         '贴纸角度',         # 贴纸长轴与包装盒水平方向的偏角（°）；空=未计算
-        '包装盒检测方式',   # edge / bright / fallback
+        '包装盒检测方式',   # edge / bright(白盒) / brown(Mac棕盒) / fallback
         '矫正方式',         # perspective / rotation / axis_aligned
         '包装盒四点坐标',   # 原图坐标系 4 角点 JSON（axis_aligned 时为空）
         '颜色检测已执行',   # 0 / 1

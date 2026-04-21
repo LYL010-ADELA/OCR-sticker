@@ -340,22 +340,32 @@ LOB_CONFIGS = {
 ```
 订单（1~4 张图片）
  │
- ├─ Phase 0  识别 LOB
- │           1) 读取 row["LOB"]，与 LOB_CONFIGS key strip+精确匹配
- │           2) 降级：关键词匹配 MPN / UPC / 产品名
- │           3) 任一路径均无法命中 → 输出列写"无法识别"，检测以 iPhone 规则兜底
+ ├─ Phase 0  识别 LOB（严格模式，只认 Excel LOB 列）
+ │           读取 row["LOB"]，与 LOB_CONFIGS key strip+精确匹配
+ │           命中 → 进入 Phase 1
+ │           未命中（缺失 / NaN / 不在枚举）→ 输出列写 "UNKNOWN LOB"，
+ │           直接标记不合格并 return（不再跑 OCR，不再用 iPhone 兜底）
  │
  ├─ Phase 1  遍历所有图片
- │           每张做 OCR + detect_box_bbox（轻量）+ 正向完整判断
+ │           每张做 OCR + detect_box_bbox(lob=...)（按 LOB 分白/棕盒策略 2）
+ │             → 正向完整判断
  │           符合条件者记入 candidates（不在此阶段做颜色检测，避免无效开销）
  │
  ├─ Phase 2  取盒子占比最大的候选图
  │
  ├─ Phase 2.5  包装盒透视矫正（三级降级，见下方 mermaid）
- │             rectify_package_box(image)
+ │             rectify_package_box(image, lob=...)
  │               → warped_img / M / (W_rect, H_rect) / method / box_quad_src
+ │             策略 1/2 不分 LOB，策略 3（axis_aligned 兜底）按 LOB 调用
+ │             detect_box_bbox(lob=...) 分流白/棕盒阈值
  │             通过 cv2.perspectiveTransform 把原图 OCR 多边形映射到矫正坐标系
  │             无 M（axis_aligned 兜底）时退化为现有 (rel = (cx-box_x)/box_w) 公式
+ │
+ ├─ Phase 2.6  主贴选择（LOB-aware，见 §5.5）
+ │             find_all_scan_stickers(texts, polys_rect) → scan_candidates
+ │             pick_best_scan_sticker(scan_candidates, W_rect, H_rect,
+ │                                    LOB.scan_sticker) → sticker_rect
+ │             按"到规范矩形的外距离"选主贴，避免多贴/背景印刷/OCR 顺序偏差
  │
  ├─ Phase 3  单贴检测（基于矫正坐标系 + LOB 配置）
  │             Step 0  非官方贴纸颜色检测（按 mode 分流，命中硬判 position_valid=4）
@@ -393,9 +403,42 @@ flowchart LR
 
 ## 五、各 LOB 特殊注意事项
 
-### 5.1 Mac 包装盒颜色检测（`brown_box` 分支）
+### 5.1 Mac 包装盒白/棕盒分流（box detect + 非官方贴纸颜色检测）
 
-Mac 使用棕色瓦楞纸箱，白盒算法的前提「白背景 S≈0，彩色块为异常」不成立：
+Mac 使用棕色瓦楞纸箱，在两个环节都需要区别于其他 LOB：
+
+#### 5.1.1 `detect_box_bbox` 的策略 2 分流
+
+包装盒轮廓检测的三级降级：
+
+| 策略 | 实现                     | 分 LOB？             |
+| --- | ----------------------- | -------------------- |
+| 1   | Canny + approxPolyDP    | 不分（纯边缘，通用）   |
+| **2** | **颜色区域阈值**         | **按 LOB 分流**        |
+| 3   | 整图 fallback            | 不分                 |
+
+策略 2 的分支：
+
+```python
+if lob == "Mac":
+    # 棕盒：HSV 范围抠棕色
+    thresh = cv2.inRange(hsv, BROWN_HSV_LOW=(5,30,40),
+                              BROWN_HSV_HIGH=(30,200,220))
+    # 再走闭运算 + 开运算消除瓦楞条纹空洞
+    method = 'brown'
+else:
+    # 白盒（iPhone / iPad / Watch / AirPods / Accy.）
+    _, thresh = cv2.threshold(filtered, 190, 255, cv2.THRESH_BINARY)
+    method = 'bright'
+```
+
+**动机**：白盒策略用灰度阈值 `>190` 抓白色像素，对棕盒会几乎无效（棕色灰度在 60~120 之间），
+只剩 fallback 整图兜底，`rel_x / rel_y` 就会严重失真。
+按 LOB 分流后，Mac 的策略 2 直接命中棕色区域，`包装盒检测方式` 列输出 `brown`。
+
+#### 5.1.2 `detect_unofficial_sticker_color` 的 `brown_box` 分支
+
+白盒算法的前提「白背景 S≈0，彩色块为异常」在棕盒上不成立：
 
 - 棕色本身 S≈50~120、H∈[5°,30°]，白平衡采样退化为 `bg_sat_ref=0.0`，归一化失效
 - **官方白色封口贴**在棕盒上是饱和度最低的区域，白盒逻辑会直接把它误判为异常
@@ -449,32 +492,85 @@ Watch 的上下封口贴纸起到物理封口作用。双贴规则与 iPhone 一
 iPad 的贴纸位置规范与 iPhone 完全一致（右上 + 右下），可直接复用相同参数。
 区别仅在于包装盒尺寸更大（大扁盒 vs 竖盒），但由于使用相对坐标系，不影响检测逻辑。
 
+### 5.5 多贴场景下的主贴选择（LOB-aware）
+
+**背景问题**：实际订单里存在一贴 / 二贴 / 多贴混合的场景，同一张图可能有
+多个 OCR 命中"扫码即领"（两张封口贴 / 背景印刷 / 副贴残留）。旧实现
+`find_sticker_from_ocr = stickers[0]` 按 OCR 顺序取第 1 个，
+顺序与空间位置无关，遇到"副贴/背景文字比主贴靠前"时会把错误坐标
+喂给后续位置验证，直接误判 `position_valid`。
+
+**新实现**：Phase 2.6 在矫正坐标系下按 LOB 规范区域打分。
+
+```python
+def pick_best_scan_sticker(scan_stickers, W_rect, H_rect, scan_position_cfg):
+    """
+    scan_position_cfg 直接用 LOB_CONFIGS[lob]["scan_sticker"]。
+    对每个候选：
+      rel_x = cx / W_rect,  rel_y = cy / H_rect
+      dist  = 到规范矩形 [x_min,x_max]×[y_min,y_max] 的外距离
+              （落入矩形内 → 0；落外 → 欧氏距离到边/角）
+    主键 dist 升序；平手时副键 rel_y 升序（更靠上优先，符合
+    iPhone/iPad/AirPods/Accy. 右上 = 太阳码贴的业务共识；
+    Mac 等底部 LOB 在"全部落入区内"场景副键不会破坏正确性）。
+    """
+```
+
+**LOB 差异自然落在 cfg 里**（不需要为每个 LOB 写分支）：
+
+| LOB           | 规范区域 (rel_x, rel_y)              | 主贴通常被选中的位置 |
+| ------------- | ----------------------------------- | ------------------------ |
+| iPhone / iPad | x 0.50\~0.95，y 0.00\~0.30         | 右上角                   |
+| AirPods / Accy. | x 0.50\~0.95，y 0.00\~0.50        | 右上偏中                 |
+| Watch         | x 0.15\~0.70，y 0.05\~0.40         | 中上                     |
+| Mac           | x 0.25\~0.75，y 0.70\~1.00         | 底部居中                 |
+
+**兜底行为**：
+
+- `scan_candidates` 为空 → 返回 `None`（Phase 3 走原"OCR 二次定位失败"分支）
+- `W_rect / H_rect ≤ 0` 或 `scan_position_cfg is None` → 退化为 `scan_stickers[0]`，
+  保持与旧实现一致的行为兜底
+- 多候选时主流程会打印一条日志：
+  `'扫码即领'候选 N 个，按 LOB=xxx 规范区域选中 text_idx=...`，
+  便于跑批后复盘选贴决策
+
+**影响面**：`find_sticker_from_ocr` 保留作为向下兼容 API，
+docstring 标注"已被 `pick_best_scan_sticker` 替代"，
+主流程 `process_row` 在 Phase 2.6 统一走新函数。
+
 ---
 
-## 六、LOB 识别方式
+## 六、LOB 识别方式（严格模式）
 
-LOB 的最权威来源是 **输入 Excel 的 `LOB` 列**（枚举：iPhone / Watch / AirPods /
-Accy. / iPad / Mac，经 21818 行 `value_counts` 确认覆盖 100%）。
+LOB 的**唯一权威来源**是输入 Excel 的 `LOB` 列，枚举：
+`iPhone / Watch / AirPods / Accy. / iPad / Mac`（经 21818 行
+`value_counts` 确认覆盖 100%）。
 
-`detect_lob(row)` 按以下优先级识别：
+`detect_lob(row)` 只做一步严格匹配：
 
-1. **Excel `LOB` 列精确匹配**：`str(row["LOB"]).strip()` 与 `LOB_CONFIGS` key 比对
-2. **关键词降级**（仅当 `LOB` 列缺失/值异常时生效）：遍历 `平台对接码(MPN)` /
-   `品牌对接码(UPC)` / `门店名称` 等列做不区分大小写的子串匹配
-3. **无法命中** → 返回 `"无法识别"`，输出列 `识别LOB` 写入该字符串，方便运营人工复核；
-   检测逻辑内部以 iPhone 规则兜底（不影响合规判定，但输出列不写 "iPhone"）
-
+```python
+raw = row.get("LOB", None)
+if raw is None or pd.isna(raw):
+    return "UNKNOWN LOB"
+key = str(raw).strip()
+return key if key in LOB_CONFIGS else "UNKNOWN LOB"
 ```
-关键词降级表（仅兜底使用，key 已对齐 Excel 枚举）：
 
-"iPhone"  → ["iPhone", "iphone"]
-"Watch"   → ["Apple Watch", "AppleWatch", "Watch"]
-"AirPods" → ["AirPods", "airpods"]
-"iPad"    → ["iPad", "ipad"]
-"Mac"     → ["MacBook", "iMac", "Mac mini", "Mac Pro", "Mac Studio", "Mac"]
-"Accy."   → ["Adapter", "Cable", "MagSafe", "Lightning", "USB-C Power",
-              "充电器", "数据线", "保护壳", "配件"]
-```
+### 6.1 为什么移除关键词降级
+
+历史版本曾用 `MPN / UPC / 门店名称` 做关键词降级，
+但**门店名称里大量出现 `Mac旗舰体验店` / `iPad专柜` / `Apple Watch 配件` 等词**，
+会把 iPhone 订单误识别为 Mac/iPad/Watch，走错位置规范导致误判。
+关键词降级的误匹配风险远高于"LOB 列缺失"这一小众场景的召回收益，
+因此彻底移除。
+
+### 6.2 UNKNOWN LOB 的处理
+
+- 输出列 `识别LOB` 写入字符串 `"UNKNOWN LOB"`
+- `是否规范粘贴 = 0`，`封口贴存在 = 0`，`贴纸位置规范 = -1`
+- `位置说明` = `"UNKNOWN LOB：Excel LOB 列缺失或不在枚举内，未执行 OCR 检测"`
+- **不再跑 OCR / 不再用 iPhone 规则兜底**：避免用错误规则产出"看似合规"的结果
+- 运营侧可按 `识别LOB == "UNKNOWN LOB"` 单独筛出这批订单补齐源数据后重跑
 
 ---
 
@@ -485,7 +581,8 @@ Accy. / iPad / Mac，经 21818 行 `value_counts` 确认覆盖 100%）。
 
 | 列名               | 类型  | 含义                                                                  |
 | ---------------- | --- | ------------------------------------------------------------------- |
-| `识别LOB`          | 文字  | 产品线（iPhone / Watch / AirPods / Accy. / iPad / Mac）                   |
+| `识别LOB`          | 文字  | 产品线（iPhone / Watch / AirPods / Accy. / iPad / Mac / **UNKNOWN LOB**） |
+| `包装盒检测方式`        | 文字  | `edge` / `bright`(白盒策略2) / **`brown`(Mac棕盒策略2)** / `fallback`        |
 | `矫正方式`           | 文字  | `perspective` / `rotation` / `axis_aligned`（三级降级命中层级）               |
 | `包装盒四点坐标`        | JSON | 原图坐标系下盒子 4 角点（TL,TR,BR,BL）；`axis_aligned` 时为空                         |
 | `颜色检测已执行`        | 0/1 | 当前 LOB 是否启用了非官方贴纸颜色检测（`unofficial_color.enabled`）                    |

@@ -67,6 +67,34 @@ AUTH_X_MAX = 0.95
 AUTH_Y_MIN = 0.70      # 底部 30%（从上往下 70%~100%）
 AUTH_Y_MAX = 1.00
 
+# ── 贴纸位置"绕折容差" ───────────────────────────────────────────────────────
+# 封口贴物理上跨越盒面与侧面/顶面/底面，OCR 识别"扫码即领"/"Apple授权专营店"
+# 的文字中心点经过透视矫正后，可能落在盒面边界外侧（常见 5%~15%，窄盒或大贴纸
+# 极端情况下更多）。为避免把正常绕折的合规贴纸误判为"位置异常"，在各 LOB
+# 规范区域四周统一放宽 ±STICKER_POSITION_TOLERANCE（相对坐标系）。
+# 该容差对"扫码即领"（scan_sticker）与"Apple授权专营店"（auth_sticker）同时生效。
+STICKER_POSITION_TOLERANCE = 0.15
+
+
+def _normalize_position_cfg(position_cfg) -> list[dict]:
+    """
+    把 LOB 的 scan_sticker / auth_sticker 配置统一转成"区域列表"：
+
+      - None          → [] （无规范）
+      - {..}          → [{..}]
+      - [{..}, {..}]  → 原样返回
+
+    目的：支持"多合规区域（任一即可）"的场景，例如 Watch 长条盒子封口贴
+    贴在顶端 **或** 底端对称位置，两处都算规范。
+    """
+    if position_cfg is None:
+        return []
+    if isinstance(position_cfg, dict):
+        return [position_cfg]
+    if isinstance(position_cfg, (list, tuple)):
+        return [c for c in position_cfg if isinstance(c, dict)]
+    return []
+
 # ── 正向完整拍摄判断阈值 ──────────────────────────────────────────────────────
 # 包装盒面积 / 图片面积 >= 此值才视为"正向完整"拍摄
 BOX_FRONTAL_MIN_RATIO = 0.20
@@ -97,9 +125,12 @@ BOX_DETECT_MAX_SIDE = 1200
 #   sticker_count:   "single_only"    仅单贴（AirPods/Accy.）
 #                    "single_or_dual" 单贴或双贴均合规（iPhone/Watch/iPad/Mac）
 #                    "dual_required"  必须双贴（当前未启用，保留扩展口径）
-#   scan_sticker:    一贴（扫码即领）规范相对坐标 {x_min,x_max,y_min,y_max}
-#                    y_max 为上限约束；y_min 用于文档说明，实际检测仅校验 x 范围与 y_max
-#   auth_sticker:    二贴（Apple 授权专营店）规范相对坐标，None 表示该 LOB 无二贴
+#   scan_sticker:    一贴（扫码即领）规范相对坐标，两种写法：
+#                      - dict  {x_min,x_max,y_min,y_max}  单一合规区域
+#                      - list[dict]                       多合规区域，命中任一即可
+#                    （Watch 长条盒封口贴可在顶端 **或** 底端对称位置，故用 list）
+#   auth_sticker:    二贴（Apple 授权专营店）规范相对坐标（同样支持 dict 或 list[dict]），
+#                    None 表示该 LOB 无二贴
 #   unofficial_color: 非官方贴纸颜色检测配置
 #     enabled:        是否启用
 #     mode:           "white_box" 白盒（白平衡归一化 + 相对饱和度，适用 iPhone/Watch/AirPods/Accy./iPad）
@@ -122,8 +153,20 @@ LOB_CONFIGS: dict[str, dict] = {
     },
     "Watch": {
         "sticker_count": "single_or_dual",
-        "scan_sticker": {"x_min": 0.15, "x_max": 0.70, "y_min": 0.05, "y_max": 0.40},
-        "auth_sticker": {"x_min": 0.15, "x_max": 0.70, "y_min": 0.60, "y_max": 0.95},
+        # Watch 盒为长条形，封口贴沿盒子中轴线贴合并绕折到两侧面，业务约束：
+        #   - 单贴：可出现在"顶端"或"底端"任一位置（用户业务允许对称位置）
+        #   - 双贴：一张顶端 + 一张底端
+        # x 方向不作硬约束（原因：长条盒矫正器稳定性较弱，rotation/perspective 误差大，
+        #   文字中心相对坐标常溢出 [0,1] 很多；关键判据是 y 位置——是否落在顶端/底端）。
+        # 因此 scan/auth 都声明两个"只约束 y"的合规区域（list[dict]），命中任一即合规。
+        "scan_sticker": [
+            {"y_min": 0.00, "y_max": 0.45},
+            {"y_min": 0.55, "y_max": 1.00},
+        ],
+        "auth_sticker": [
+            {"y_min": 0.00, "y_max": 0.45},
+            {"y_min": 0.55, "y_max": 1.00},
+        ],
         "unofficial_color": {
             "enabled": True,
             "mode": "white_box",
@@ -1134,7 +1177,7 @@ def find_sticker_from_ocr(texts: list[str], polys: list) -> dict | None:
 def _scan_sticker_distance_to_zone(
     rel_x: float,
     rel_y: float,
-    scan_position_cfg: dict,
+    scan_position_cfg,
 ) -> float:
     """
     计算单个扫码贴（归一化相对坐标）到 LOB 规范矩形区域的距离。
@@ -1142,30 +1185,38 @@ def _scan_sticker_distance_to_zone(
     约定（相对坐标系 0.0~1.0）：
       - 贴纸落在 [x_min, x_max] × [y_min, y_max] 内 → 距离 0
       - 落在区域外        → 距离 = 到最近边/角的欧氏距离（矩形外距离）
+      - scan_position_cfg 支持 dict 或 list[dict]：多区域时取到最近区域的距离
 
     区域四个边界任意侧 cfg 缺失时按 ±∞ 处理（不约束该侧），
     避免 None/缺省导致 TypeError。
     """
-    if scan_position_cfg is None:
+    zones = _normalize_position_cfg(scan_position_cfg)
+    if not zones:
         return float("inf")
-    x_min = scan_position_cfg.get("x_min", -float("inf"))
-    x_max = scan_position_cfg.get("x_max",  float("inf"))
-    y_min = scan_position_cfg.get("y_min", -float("inf"))
-    y_max = scan_position_cfg.get("y_max",  float("inf"))
 
-    dx = 0.0
-    if rel_x < x_min:
-        dx = x_min - rel_x
-    elif rel_x > x_max:
-        dx = rel_x - x_max
+    best = float("inf")
+    for zone in zones:
+        x_min = zone.get("x_min", -float("inf"))
+        x_max = zone.get("x_max",  float("inf"))
+        y_min = zone.get("y_min", -float("inf"))
+        y_max = zone.get("y_max",  float("inf"))
 
-    dy = 0.0
-    if rel_y < y_min:
-        dy = y_min - rel_y
-    elif rel_y > y_max:
-        dy = rel_y - y_max
+        dx = 0.0
+        if rel_x < x_min:
+            dx = x_min - rel_x
+        elif rel_x > x_max:
+            dx = rel_x - x_max
 
-    return float((dx * dx + dy * dy) ** 0.5)
+        dy = 0.0
+        if rel_y < y_min:
+            dy = y_min - rel_y
+        elif rel_y > y_max:
+            dy = rel_y - y_max
+
+        d = float((dx * dx + dy * dy) ** 0.5)
+        if d < best:
+            best = d
+    return best
 
 
 def pick_best_scan_sticker(
@@ -1264,24 +1315,30 @@ def find_auth_sticker_from_ocr(
 def validate_sticker_position(
     rel_cx: float,
     rel_cy: float,
-    position_cfg: dict,
+    position_cfg,
+    tolerance: float = STICKER_POSITION_TOLERANCE,
 ) -> dict:
     """
     验证已归一化的相对坐标是否满足规范位置（纯函数，无包装盒耦合）。
 
-    position_cfg 结构：{"x_min", "x_max", "y_min", "y_max"}
+    position_cfg 支持两种形式：
+      - dict            {"x_min", "x_max", "y_min", "y_max"} —— 单一合规区域
+      - list[dict]      多合规区域，命中任一即合规。适用于 Watch 长条盒子：
+                        封口贴可贴在盒子顶端 **或** 底端对称位置，两处均视为规范。
+
     业务约定：
-      - x 双侧硬约束： x_min <= rel_x <= x_max
-      - y 在字段名上提供 y_min/y_max，以双侧约束判定（与历史"仅上限"略有差异，
-        但配合矫正坐标系更直观；上下界若任何一侧为 None 则视为不约束）
+      - x/y 双侧硬约束（x_min/x_max/y_min/y_max 任一缺省视为该侧不约束）
+      - tolerance：绕折容差。封口贴跨越盒面边界到侧面/顶面/底面，OCR 文字中心
+        经过透视矫正后常溢出盒面 5%~10%，此容差避免合规贴纸被误判。
 
     返回 dict:
       in_correct_position : bool
       rel_x, rel_y        : 相对坐标（四舍五入）
-      x_ok, y_ok          : 各轴是否达标
+      x_ok, y_ok          : 各轴是否达标（多区域时指失败解释里"最接近"的那个区域）
       detail              : 文字说明
     """
-    if position_cfg is None:
+    zones = _normalize_position_cfg(position_cfg)
+    if not zones:
         return {
             "in_correct_position": False,
             "rel_x": round(rel_cx, 4) if rel_cx is not None else None,
@@ -1290,26 +1347,51 @@ def validate_sticker_position(
             "detail": "位置验证跳过（该 LOB 未配置规范位置）",
         }
 
-    x_min = position_cfg.get("x_min", -float("inf"))
-    x_max = position_cfg.get("x_max", float("inf"))
-    y_min = position_cfg.get("y_min", -float("inf"))
-    y_max = position_cfg.get("y_max", float("inf"))
+    tol = max(float(tolerance), 0.0)
 
-    x_ok = x_min <= rel_cx <= x_max
-    y_ok = y_min <= rel_cy <= y_max
+    def _check_zone(zone: dict):
+        x_min = zone.get("x_min", -float("inf"))
+        x_max = zone.get("x_max",  float("inf"))
+        y_min = zone.get("y_min", -float("inf"))
+        y_max = zone.get("y_max",  float("inf"))
 
-    if x_ok and y_ok:
-        detail = f"位置规范 (rel_x={rel_cx:.3f}, rel_y={rel_cy:.3f})"
-    else:
-        parts = []
-        if not x_ok:
-            parts.append(f"X={rel_cx:.3f} 不在 [{x_min},{x_max}]")
-        if not y_ok:
-            parts.append(f"Y={rel_cy:.3f} 不在 [{y_min},{y_max}]")
-        detail = "位置异常：" + "；".join(parts)
+        x_lo = x_min - tol if x_min != -float("inf") else x_min
+        x_hi = x_max + tol if x_max !=  float("inf") else x_max
+        y_lo = y_min - tol if y_min != -float("inf") else y_min
+        y_hi = y_max + tol if y_max !=  float("inf") else y_max
+
+        x_ok = x_lo <= rel_cx <= x_hi
+        y_ok = y_lo <= rel_cy <= y_hi
+        return x_ok, y_ok, (x_min, x_max, y_min, y_max)
+
+    # 逐个区域校验：命中任一即规范；失败时用"命中轴数最多"的区域作解释，减少 detail 噪音
+    best_fail = None
+    for zone in zones:
+        x_ok, y_ok, bounds = _check_zone(zone)
+        if x_ok and y_ok:
+            return {
+                "in_correct_position": True,
+                "rel_x": round(rel_cx, 4),
+                "rel_y": round(rel_cy, 4),
+                "x_ok": True, "y_ok": True,
+                "detail": (f"位置规范 (rel_x={rel_cx:.3f}, rel_y={rel_cy:.3f}, "
+                           f"绕折容差±{tol:.2f})"),
+            }
+        score = int(x_ok) + int(y_ok)
+        if best_fail is None or score > best_fail[0]:
+            best_fail = (score, x_ok, y_ok, bounds)
+
+    _, x_ok, y_ok, (x_min, x_max, y_min, y_max) = best_fail
+    parts = []
+    if not x_ok:
+        parts.append(f"X={rel_cx:.3f} 不在 [{x_min},{x_max}]±{tol:.2f}")
+    if not y_ok:
+        parts.append(f"Y={rel_cy:.3f} 不在 [{y_min},{y_max}]±{tol:.2f}")
+    multi = " (多区域任一)" if len(zones) > 1 else ""
+    detail = f"位置异常{multi}：" + "；".join(parts)
 
     return {
-        "in_correct_position": x_ok and y_ok,
+        "in_correct_position": False,
         "rel_x": round(rel_cx, 4),
         "rel_y": round(rel_cy, 4),
         "x_ok": x_ok,
@@ -1995,10 +2077,10 @@ def _print_summary(r: dict):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    input_file   = '/home/ubuntu/OCR/????? 件附件内容-0407-V2.xlsx'
-    output_csv   = '/home/ubuntu/OCR/????? 件附件内容-0407-V2_results.csv'
-    output_json  = '/home/ubuntu/OCR/????? 件附件内容-0407-V2_results.jsonl'
-    output_excel = '/home/ubuntu/OCR/????? 件附件内容-0407-V2_processed.xlsx'
+    input_file   = '/home/ubuntu/OCR/出库照片_商派小程序_W1W2W4_top2850.xlsx'
+    output_csv   = '/home/ubuntu/OCR/出库照片_商派小程序_W1W2W4_top2850_results.csv'
+    output_json  = '/home/ubuntu/OCR/出库照片_商派小程序_W1W2W4_top2850_results.jsonl'
+    output_excel = '/home/ubuntu/OCR/出库照片_商派小程序_W1W2W4_top2850_processed.xlsx'
 
     NEW_COLS = [
         '识别LOB',          # iPhone / Watch / AirPods / Accy. / iPad / Mac

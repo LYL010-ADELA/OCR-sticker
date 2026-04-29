@@ -95,9 +95,11 @@ def _normalize_position_cfg(position_cfg) -> list[dict]:
         return [c for c in position_cfg if isinstance(c, dict)]
     return []
 
-# ── 正向完整拍摄判断阈值 ──────────────────────────────────────────────────────
-# 包装盒面积 / 图片面积 >= 此值才视为"正向完整"拍摄
-BOX_FRONTAL_MIN_RATIO = 0.20
+# ── 正向完整拍摄判断阈值（极端兜底）────────────────────────────────────────
+# 下游 rel_x/rel_y 已经按"贴纸 / 盒子"做了归一化，盒子绝对大小不应影响位置判定，
+# 因此不能把"盒子占图比例小"等同于"非正向完整"——AirPods 这种小盒子 + 远拍场景，
+# 占比 5%~15% 也是合规图。这里只保留极松的兜底，过滤纯模糊远景或盒子被裁飞的边角图。
+BOX_FRONTAL_MIN_RATIO = 0.02
 
 # 平铺错误检测参数（已改为语义信号，此处保留供注释说明）
 FLAT_STICKER_ASPECT_RATIO = 4.0   # 保留，供扩展用
@@ -136,11 +138,18 @@ BOX_DETECT_MAX_SIDE = 1200
 #     mode:           "white_box" 白盒（白平衡归一化 + 相对饱和度，适用 iPhone/Watch/AirPods/Accy./iPad）
 #                     "brown_box" 棕盒（排除棕 + 排除白 + 绝对饱和度，适用 Mac）
 #     其他阈值:       详见各 LOB 字段
+#   front_face_aspect_range:
+#     正面长宽比（长边/短边，永远 >= 1.0）的合理区间，仅用于矫正阶段从多个候选
+#     凸四边形中挑选"封口贴所在的正面"。Mac 等立体盒子拍照常同时露出正面+侧面
+#     +顶面，axis-aligned bbox 会把它们框在一起导致 rel_x/rel_y 失真；
+#     给定该 LOB 的正面长宽比后，矫正器优先挑长宽比落入该区间、且内部包含
+#     "扫码即领"文字框的那个面作为坐标系基准。值为 None 时不约束。
 LOB_CONFIGS: dict[str, dict] = {
     "iPhone": {
         "sticker_count": "single_or_dual",
         "scan_sticker": {"x_min": 0.50, "x_max": 0.95, "y_min": 0.00, "y_max": 0.30},
         "auth_sticker": {"x_min": 0.50, "x_max": 0.95, "y_min": 0.70, "y_max": 1.00},
+        "front_face_aspect_range": (1.6, 2.4),   # iPhone 包装盒正面 ≈ 1.7~2.2
         "unofficial_color": {
             "enabled": True,
             "mode": "white_box",
@@ -167,6 +176,7 @@ LOB_CONFIGS: dict[str, dict] = {
             {"y_min": 0.00, "y_max": 0.45},
             {"y_min": 0.55, "y_max": 1.00},
         ],
+        "front_face_aspect_range": (2.5, 5.0),   # Watch 长条盒正面长宽比大
         "unofficial_color": {
             "enabled": True,
             "mode": "white_box",
@@ -181,6 +191,7 @@ LOB_CONFIGS: dict[str, dict] = {
         "sticker_count": "single_only",
         "scan_sticker": {"x_min": 0.50, "x_max": 0.95, "y_min": 0.00, "y_max": 0.50},
         "auth_sticker": None,
+        "front_face_aspect_range": (0.85, 1.35),  # AirPods 盒近似正方形
         "unofficial_color": {
             "enabled": True,
             "mode": "white_box",
@@ -195,6 +206,7 @@ LOB_CONFIGS: dict[str, dict] = {
         "sticker_count": "single_only",
         "scan_sticker": {"x_min": 0.50, "x_max": 0.95, "y_min": 0.00, "y_max": 0.50},
         "auth_sticker": None,
+        "front_face_aspect_range": None,         # 配件类目尺寸差异大，不约束
         "unofficial_color": {
             "enabled": True,
             "mode": "white_box",
@@ -209,6 +221,7 @@ LOB_CONFIGS: dict[str, dict] = {
         "sticker_count": "single_or_dual",
         "scan_sticker": {"x_min": 0.50, "x_max": 0.95, "y_min": 0.00, "y_max": 0.30},
         "auth_sticker": {"x_min": 0.50, "x_max": 0.95, "y_min": 0.70, "y_max": 1.00},
+        "front_face_aspect_range": (1.2, 1.7),   # iPad 包装盒正面 ≈ 1.3~1.5
         "unofficial_color": {
             "enabled": True,
             "mode": "white_box",
@@ -223,6 +236,7 @@ LOB_CONFIGS: dict[str, dict] = {
         "sticker_count": "single_or_dual",
         "scan_sticker": {"x_min": 0.25, "x_max": 0.75, "y_min": 0.70, "y_max": 1.00},
         "auth_sticker": {"x_min": 0.05, "x_max": 0.50, "y_min": 0.00, "y_max": 0.30},
+        "front_face_aspect_range": (1.2, 2.0),   # MacBook 包装盒正面 ≈ 1.4~1.7
         "unofficial_color": {
             "enabled": True,
             "mode": "brown_box",
@@ -524,11 +538,61 @@ def _order_quad_corners(pts: np.ndarray) -> np.ndarray:
     return rect
 
 
-def _find_box_quad(img_cv: np.ndarray) -> np.ndarray | None:
+# ─── 内部常量：候选凸四边形的几何最小要求 ────────────────────────────────────
+_QUAD_MAX_ASPECT = 8.0   # 允许细长侧面进入候选，由打分把它们排出去
+_QUAD_MIN_EDGE   = 10    # 任一边短于 10px → 噪点
+
+
+def _quad_from_contour(cnt: np.ndarray) -> np.ndarray | None:
     """
-    尝试在图像中找到包装盒的 4 顶点四边形（原图坐标系）。
-    使用 Canny+膨胀 → 最大轮廓 → approxPolyDP；
-    返回形状 (4, 2) 的 float32 数组；失败返回 None。
+    把单个轮廓拟合成形状为 (4,2) 的凸四边形（缩放图坐标系）。
+
+    优先 approxPolyDP（边缘清晰），不行则用 minAreaRect 兜底。
+    AirPods/Mac 这类实拍场景里 Canny 主轮廓常呈现 5~6 凹点
+    （边角磨圆 + 阴影边缘），必须靠 minAreaRect 才能得到可矫正的四边形。
+    """
+    peri = cv2.arcLength(cnt, True)
+    for eps_ratio in (0.02, 0.03, 0.04, 0.05):
+        approx = cv2.approxPolyDP(cnt, eps_ratio * peri, True)
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            cand = approx.reshape(4, 2).astype(np.float32)
+            xs, ys = cand[:, 0], cand[:, 1]
+            w_hat = float(max(xs) - min(xs))
+            h_hat = float(max(ys) - min(ys))
+            if min(w_hat, h_hat) < _QUAD_MIN_EDGE:
+                return None
+            aspect = max(w_hat, h_hat) / max(min(w_hat, h_hat), 1.0)
+            if aspect > _QUAD_MAX_ASPECT:
+                return None
+            return cand
+        if len(approx) > 4:
+            continue
+        if len(approx) < 4:
+            break
+
+    # minAreaRect 兜底
+    try:
+        rect = cv2.minAreaRect(cnt)
+        cw, ch = rect[1]
+        if min(cw, ch) >= _QUAD_MIN_EDGE:
+            aspect = max(cw, ch) / max(min(cw, ch), 1.0)
+            if aspect <= _QUAD_MAX_ASPECT:
+                return cv2.boxPoints(rect).astype(np.float32)
+    except Exception:
+        return None
+    return None
+
+
+def _find_quads_canny(
+    img_cv: np.ndarray,
+    max_candidates: int = 8,
+    min_area_ratio: float = 0.03,
+) -> list[np.ndarray]:
+    """
+    通用路径：Canny 边缘 + 形态学膨胀 → 外部轮廓 → 候选凸四边形。
+
+    适用于白色包装盒（iPhone/iPad/Watch/AirPods/Accy.）以及 Mac 平铺正面拍摄。
+    立体棕盒拍摄（多个面共面）效果差，需配合 _find_quads_brown_split 补充。
     """
     H, W = img_cv.shape[:2]
     scale = min(1.0, BOX_DETECT_MAX_SIDE / max(H, W))
@@ -544,43 +608,247 @@ def _find_box_quad(img_cv: np.ndarray) -> np.ndarray | None:
     contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
-    MIN_AREA_RATIO = 0.08
-    MAX_ASPECT = 5.0
-
-    for cnt in contours[:10]:
-        if cv2.contourArea(cnt) < MIN_AREA_RATIO * dW * dH:
+    quads: list[np.ndarray] = []
+    for cnt in contours[:25]:
+        if cv2.contourArea(cnt) < min_area_ratio * dW * dH:
             continue
-        peri = cv2.arcLength(cnt, True)
-        # 逐步放宽 eps，尽可能拟合到 4 点
-        for eps_ratio in (0.02, 0.03, 0.04, 0.05):
-            approx = cv2.approxPolyDP(cnt, eps_ratio * peri, True)
-            if len(approx) == 4 and cv2.isContourConvex(approx):
-                quad = approx.reshape(4, 2).astype(np.float32)
-                xs = quad[:, 0]; ys = quad[:, 1]
-                w_hat = max(xs) - min(xs)
-                h_hat = max(ys) - min(ys)
-                if min(w_hat, h_hat) < 10:
-                    break
-                aspect = w_hat / max(h_hat, 1.0)
-                if not ((1.0 / MAX_ASPECT) <= aspect <= MAX_ASPECT):
-                    break
-                # 还原到原图坐标系
-                quad_orig = quad / scale
-                return quad_orig.astype(np.float32)
-            if len(approx) > 4:
-                continue
-            if len(approx) < 4:
+        quad_small = _quad_from_contour(cnt)
+        if quad_small is not None:
+            quads.append((quad_small / scale).astype(np.float32))
+        if len(quads) >= max_candidates:
+            break
+    return quads
+
+
+def _find_quads_brown_split(
+    img_cv: np.ndarray,
+    max_candidates: int = 8,
+    min_area_ratio: float = 0.03,
+) -> list[np.ndarray]:
+    """
+    Mac 棕盒专用：HSV 棕色掩码 → 盒子主体 → 在主体内部用敏感 Canny
+    检测折线 → 把折线膨胀作为"分割线"切分主体 → 每个子面用 minAreaRect
+    得到候选四边形。
+
+    设计动机：
+      Mac 包装是棕色瓦楞纸盒，门店常斜放立体拍摄（正面 + 顶面 + 侧面同框）。
+      _find_quads_canny 的 Canny+膨胀策略在棕色低对比场景下会把"盒子+背景反光"
+      合并成一个外包络，得不到分开的"正面/顶面"候选，rel_x/rel_y 完全失真。
+      本函数先用棕色掩码隔离盒子主体，再在内部用低阈值 Canny + 膨胀切分子面，
+      让正面/顶面/侧面各自成为独立候选，配合 _pick_front_quad 长宽比 + 含
+      扫码即领文字框 打分即可挑出真正的"封口贴所在面"。
+
+    实测：row738_img2（立体盒）能切出正面（占图 26.5%，长宽比 1.17）。
+    """
+    H, W = img_cv.shape[:2]
+    scale = min(1.0, BOX_DETECT_MAX_SIDE / max(H, W))
+    dW, dH = max(1, int(W * scale)), max(1, int(H * scale))
+    img_small = cv2.resize(img_cv, (dW, dH), interpolation=cv2.INTER_AREA)
+
+    # ── 棕色掩码（盒子主体）──────────────────────────────────────────────
+    hsv = cv2.cvtColor(img_small, cv2.COLOR_BGR2HSV)
+    brown_mask = cv2.inRange(
+        hsv,
+        np.array(BROWN_HSV_LOW, dtype=np.uint8),
+        np.array(BROWN_HSV_HIGH, dtype=np.uint8),
+    )
+    border = max(5, int(min(dW, dH) * 0.01))
+    brown_mask[:border, :]  = 0; brown_mask[-border:, :] = 0
+    brown_mask[:, :border]  = 0; brown_mask[:, -border:] = 0
+    k7 = np.ones((7, 7), np.uint8)
+    brown_mask = cv2.morphologyEx(brown_mask, cv2.MORPH_CLOSE, k7, iterations=2)
+    brown_mask = cv2.morphologyEx(brown_mask, cv2.MORPH_OPEN,  k7, iterations=1)
+
+    contours, _ = cv2.findContours(brown_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    box_outline = contours[0]
+    if cv2.contourArea(box_outline) < min_area_ratio * dW * dH:
+        return []
+
+    box_mask = np.zeros((dH, dW), dtype=np.uint8)
+    cv2.drawContours(box_mask, [box_outline], -1, 255, -1)
+
+    # ── 在盒子内部用敏感 Canny 找折线，bitwise 切分子面 ──────────────────
+    gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
+    filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+    inner_edges = cv2.Canny(filtered, 5, 25)   # 比通用路径敏感得多
+    inner_edges[box_mask == 0] = 0
+    edges_dil = cv2.dilate(inner_edges, np.ones((5, 5), np.uint8), iterations=2)
+    sub_mask = cv2.bitwise_and(box_mask, cv2.bitwise_not(edges_dil))
+
+    sub_cnts, _ = cv2.findContours(sub_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    sub_cnts = sorted(sub_cnts, key=cv2.contourArea, reverse=True)
+
+    quads: list[np.ndarray] = []
+    for cnt in sub_cnts[:15]:
+        if cv2.contourArea(cnt) < min_area_ratio * dW * dH:
+            continue
+        quad_small = _quad_from_contour(cnt)
+        if quad_small is not None:
+            quads.append((quad_small / scale).astype(np.float32))
+        if len(quads) >= max_candidates:
+            break
+    return quads
+
+
+def _dedup_quads(
+    quads: list[np.ndarray],
+    center_threshold: float = 50.0,
+) -> list[np.ndarray]:
+    """
+    按四边形中心点欧氏距离去重，避免两路检测合并后出现近似重复候选。
+    后入候选若与已存在候选的中心距 < center_threshold，则丢弃。
+    """
+    out: list[np.ndarray] = []
+    for q in quads:
+        cx = float(q[:, 0].mean())
+        cy = float(q[:, 1].mean())
+        is_dup = False
+        for q2 in out:
+            cx2 = float(q2[:, 0].mean())
+            cy2 = float(q2[:, 1].mean())
+            if (cx - cx2) ** 2 + (cy - cy2) ** 2 < center_threshold ** 2:
+                is_dup = True
                 break
-    return None
+        if not is_dup:
+            out.append(q)
+    return out
+
+
+def _find_box_quads(
+    img_cv: np.ndarray,
+    max_candidates: int = 8,
+    min_area_ratio: float = 0.03,
+    lob: str | None = None,
+) -> list[np.ndarray]:
+    """
+    枚举图像中可能的包装盒"面"——返回多个候选凸四边形（原图坐标系）。
+
+    检测路径按 LOB 自动分流：
+      • 通用路径（_find_quads_canny）：所有 LOB 都跑。
+      • 棕盒分割（_find_quads_brown_split）：仅 Mac 跑，弥补 Canny 在棕色
+        低对比+立体拍摄下"多面合并外包络"的缺陷。
+    两路结果合并后按中心点去重，按面积降序返回。
+
+    上层 _pick_front_quad 配合 LOB 正面长宽比 + "扫码即领"文字框位置打分
+    挑选真正的封口贴正面。
+
+    返回：list[np.ndarray]，每个 shape=(4,2) float32；找不到返回 []。
+    """
+    quads = _find_quads_canny(img_cv, max_candidates, min_area_ratio)
+
+    if lob == "Mac":
+        brown_quads = _find_quads_brown_split(img_cv, max_candidates, min_area_ratio)
+        # 棕盒分割提供"内部各面"，通用路径提供"外包络/侧面" —— 两路互补
+        quads = quads + brown_quads
+
+    quads = _dedup_quads(quads)
+    quads.sort(key=lambda q: cv2.contourArea(q), reverse=True)
+    return quads[:max_candidates]
+
+
+def _quad_size_aspect(quad: np.ndarray) -> tuple[float, float, float]:
+    """
+    根据四边形的 4 个角点估计"矫正后"宽高与长宽比（长/短，永远 >= 1.0）。
+    采用 _order_quad_corners 排序后，取 (上/下) 两条边最长边为宽，
+    (左/右) 两条边最长边为高，与 rectify_package_box 用同一约定。
+    """
+    ordered = _order_quad_corners(quad)
+    tl, tr, br, bl = ordered
+    w = max(float(np.linalg.norm(tr - tl)), float(np.linalg.norm(br - bl)))
+    h = max(float(np.linalg.norm(bl - tl)), float(np.linalg.norm(br - tr)))
+    long_edge  = max(w, h)
+    short_edge = max(min(w, h), 1.0)
+    return w, h, long_edge / short_edge
+
+
+def _score_quad(
+    quad: np.ndarray,
+    scan_centers_orig: list[tuple[float, float]],
+    aspect_range: tuple[float, float] | None,
+    img_area: float,
+) -> float:
+    """
+    给单个候选四边形打分，越高越像"封口贴所在的正面"。
+
+    打分项（权重经过 row5/row738/row395 实测调参）：
+      - contain_score (0 / 2.0)：四边形是否包住任意"扫码即领"文字框中心。
+        最强信号——封口贴必在正面，正面必含扫码即领。
+      - aspect_score  (0 ~ 1.5)：长宽比是否落入 LOB 正面区间。
+        【命中区间得满分 1.5（高于 contain_score 之外的所有项之和）】
+        这是为了在两个候选"都含扫码"的场景下（典型如 Mac 立体盒子的
+        外包络 + 棕盒分割得到的真正正面），让"长宽比刚好正面"的候选
+        显著领先于"长宽比偏出但稍大"的外包络。
+        区间外按线性距离扣分。
+      - area_score    (0 ~ 0.15)：tie-breaker。仅在前两项打平时区分大小。
+        权重压低是因为外包络 area 更大但语义错误。
+    """
+    contain_score = 0.0
+    if scan_centers_orig:
+        quad_pts = quad.reshape(-1, 1, 2).astype(np.float32)
+        for cx, cy in scan_centers_orig:
+            try:
+                if cv2.pointPolygonTest(quad_pts, (float(cx), float(cy)), False) >= 0:
+                    contain_score = 2.0
+                    break
+            except Exception:
+                continue
+
+    aspect_score = 0.0
+    if aspect_range is not None:
+        _, _, aspect = _quad_size_aspect(quad)
+        lo, hi = aspect_range
+        if lo <= aspect <= hi:
+            aspect_score = 1.5
+        else:
+            d = min(abs(aspect - lo), abs(aspect - hi))
+            aspect_score = max(0.0, 1.0 - d * 0.6)
+
+    area = float(cv2.contourArea(quad))
+    area_score = min(1.0, (area / max(img_area, 1.0)) ** 0.5)
+
+    return contain_score + aspect_score + 0.15 * area_score
+
+
+def _pick_front_quad(
+    quads: list[np.ndarray],
+    scan_centers_orig: list[tuple[float, float]],
+    aspect_range: tuple[float, float] | None,
+    img_area: float,
+) -> np.ndarray | None:
+    """
+    从多个候选凸四边形中挑选最有可能是"封口贴所在的正面"的那一个。
+    候选为空返回 None；只有 1 个直接返回；多个时按 _score_quad 取分数最高。
+    """
+    if not quads:
+        return None
+    if len(quads) == 1:
+        return quads[0]
+    return max(
+        quads,
+        key=lambda q: _score_quad(q, scan_centers_orig, aspect_range, img_area),
+    )
+
+
+# ─── 兼容入口（旧调用：单个四边形）─────────────────────────────────────────
+def _find_box_quad(img_cv: np.ndarray) -> np.ndarray | None:
+    """向下兼容旧调用：返回面积最大的候选四边形（不做正面打分）。"""
+    quads = _find_box_quads(img_cv, max_candidates=1, min_area_ratio=0.08)
+    return quads[0] if quads else None
 
 
 def rectify_package_box(
     image_pil: Image.Image,
     lob: str | None = None,
+    scan_polys_orig: list | None = None,
 ) -> dict:
     """
     包装盒矫正（三级降级）：
-        1) 四点透视矫正（perspective）：approxPolyDP 得到凸四边形 → warpPerspective
+        1) 四点透视矫正（perspective）：approxPolyDP 得到多个候选凸四边形，
+           结合 LOB 正面长宽比 + "扫码即领"文字框落在哪个面 → 打分挑正面 →
+           warpPerspective 把正面拉成矩形坐标系
         2) minAreaRect 旋转矫正（rotation）：最大轮廓最小外接旋转矩形 → warpAffine 后裁剪
         3) 轴对齐兜底（axis_aligned）：复用现行 detect_box_bbox 的轴对齐 bbox
 
@@ -588,9 +856,14 @@ def rectify_package_box(
     矫正后坐标系中，包装盒覆盖 (0, 0) ~ (W_rect, H_rect)，贴纸相对坐标 = 除以 W_rect/H_rect。
 
     参数：
-      image_pil : PIL Image
-      lob       : LOB key，用于 axis_aligned 兜底时选择白盒/棕盒阈值（见 detect_box_bbox）。
-                  策略 1/2 走纯边缘/minAreaRect，不分 LOB；策略 3 兜底才会用到 lob。
+      image_pil       : PIL Image
+      lob             : LOB key，用于：
+                          • 策略 1：读取 front_face_aspect_range 给候选四边形打分
+                          • 策略 3：选择白盒/棕盒阈值（见 detect_box_bbox）
+                        策略 2 走纯 minAreaRect，不分 LOB。
+      scan_polys_orig : 原图坐标系下"扫码即领"文字框的 OCR 多边形列表（可选）。
+                        提供时策略 1 会优先选"包含扫码即领文字"的那个面作为正面，
+                        显著降低立体盒子（Mac 等）误把侧面/外包络当正面的概率。
 
     返回 dict：
         warped_img:   np.ndarray  矫正后 BGR 图（axis_aligned 兜底时为裁剪后的 bbox 子图）
@@ -603,8 +876,29 @@ def rectify_package_box(
     img_cv = pil_to_cv(image_pil)
     H_img, W_img = img_cv.shape[:2]
 
-    # ── 策略 1：四点透视矫正 ─────────────────────────────────────────────────
-    quad = _find_box_quad(img_cv)
+    # ── 策略 1：四点透视矫正（多候选 + 正面打分挑选）──────────────────────
+    quads = _find_box_quads(img_cv, lob=lob)
+    quad: np.ndarray | None = None
+    if quads:
+        aspect_range = None
+        if lob and lob in LOB_CONFIGS:
+            aspect_range = LOB_CONFIGS[lob].get("front_face_aspect_range")
+
+        scan_centers: list[tuple[float, float]] = []
+        if scan_polys_orig:
+            for poly in scan_polys_orig:
+                try:
+                    pts = np.array(poly, dtype=float)
+                    scan_centers.append(
+                        (float(pts[:, 0].mean()), float(pts[:, 1].mean()))
+                    )
+                except Exception:
+                    continue
+
+        quad = _pick_front_quad(
+            quads, scan_centers, aspect_range, float(W_img * H_img)
+        )
+
     if quad is not None:
         try:
             ordered = _order_quad_corners(quad)
@@ -1878,7 +2172,16 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
     print(f"\n  ✓ 选定候选图：盒子占比={best['box_ratio']:.2f}，方法={best['box_method']}")
 
     # ═══ Phase 2.5：包装盒透视矫正（只对 best 做一次，按 LOB 分流白/棕盒兜底）══════
-    rectify = rectify_package_box(best["image"], lob=lob)
+    # 把"扫码即领"OCR 多边形（原图坐标）传给矫正器，让透视矫正在多个候选面中
+    # 优先选"包含扫码即领"的那个面作为正面，避免 Mac 立体盒子把侧面/外包络当正面。
+    scan_polys_orig_for_rect = [
+        best["polys_orig"][i]
+        for i, t in enumerate(best["texts"])
+        if "扫码即领" in t and i < len(best["polys_orig"])
+    ]
+    rectify = rectify_package_box(
+        best["image"], lob=lob, scan_polys_orig=scan_polys_orig_for_rect,
+    )
     rect_method  = rectify["method"]
     warped_img   = rectify["warped_img"]
     M            = rectify["M"]

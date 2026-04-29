@@ -262,6 +262,16 @@ STICKER_POSITION_TOLERANCE = 0.15   # 相对坐标系容差
   位置校验时在每个规范区域四周统一放宽 ±0.15，避免合规的正常绕折贴纸被误判。
 
 
+正向完整判断阈值（极端兜底）：
+
+BOX_FRONTAL_MIN_RATIO = 0.02   # 包装盒占图片面积的极松下限
+
+  设计动机：下游 rel_x/rel_y 已基于矫正坐标系归一化，盒子绝对大小不应影响
+  位置判定。AirPods 这类小盒子+门店远拍场景，盒子占图 5%~15% 是常见的合规
+  情况。原阈值 0.20 会一刀切过滤掉这些有效图，与归一化设计自相矛盾。
+  现行 0.02 仅用于过滤"盒子被裁飞 / 模糊远景 / 完全失焦"的极端兜底场景。
+
+
 LOB 配置字典结构（Python 伪代码）：
 
 LOB_CONFIGS = {
@@ -275,6 +285,7 @@ LOB_CONFIGS = {
             "x_min": 0.50, "x_max": 0.95,
             "y_min": 0.70, "y_max": 1.00,
         },
+        "front_face_aspect_range": (1.6, 2.4),    # 正面长宽比（长边/短边，≥1）
         "unofficial_color": {
             "enabled": True,
             "mode": "white_box",                  # 白平衡归一化 + 相对饱和度
@@ -297,6 +308,7 @@ LOB_CONFIGS = {
             {"y_min": 0.00, "y_max": 0.45},
             {"y_min": 0.55, "y_max": 1.00},
         ],
+        "front_face_aspect_range": (2.5, 5.0),    # Watch 长条盒
         "unofficial_color": { "enabled": True, "mode": "white_box",
                               ... (阈值同 iPhone) ... },
     },
@@ -305,6 +317,7 @@ LOB_CONFIGS = {
         "scan_sticker": {"x_min": 0.50, "x_max": 0.95,
                          "y_min": 0.00, "y_max": 0.50},
         "auth_sticker": None,                     # 无二贴
+        "front_face_aspect_range": (0.85, 1.35),  # AirPods 近似正方形
         "unofficial_color": { "enabled": True, "mode": "white_box",
                               ... (阈值同 iPhone) ... },
     },
@@ -313,6 +326,7 @@ LOB_CONFIGS = {
         "scan_sticker": {"x_min": 0.50, "x_max": 0.95,
                          "y_min": 0.00, "y_max": 0.50},
         "auth_sticker": None,
+        "front_face_aspect_range": None,          # 配件类目尺寸差异大，不约束
         "unofficial_color": { "enabled": True, "mode": "white_box",
                               ... (阈值同 iPhone) ... },
     },
@@ -322,6 +336,7 @@ LOB_CONFIGS = {
                          "y_min": 0.00, "y_max": 0.30},
         "auth_sticker": {"x_min": 0.50, "x_max": 0.95,
                          "y_min": 0.70, "y_max": 1.00},
+        "front_face_aspect_range": (1.2, 1.7),    # iPad 大扁盒
         "unofficial_color": { "enabled": True, "mode": "white_box",
                               ... (阈值同 iPhone) ... },
     },
@@ -331,6 +346,7 @@ LOB_CONFIGS = {
                          "y_min": 0.70, "y_max": 1.00},
         "auth_sticker": {"x_min": 0.05, "x_max": 0.50,
                          "y_min": 0.00, "y_max": 0.30},
+        "front_face_aspect_range": (1.2, 2.0),    # MacBook 棕盒正面 ≈ 1.4~1.7
         "unofficial_color": {
             "enabled": True,
             "mode": "brown_box",                   # 棕盒专用：排除棕+排除白+绝对饱和度
@@ -348,6 +364,17 @@ LOB_CONFIGS = {
     },
 }
 ```
+
+`front_face_aspect_range` 字段（**新增，仅用于矫正阶段挑正面**）：
+
+- 含义：该 LOB 包装盒"正面"的长宽比合理区间（永远定义为 长边/短边，≥1.0）。
+- 用途：`rectify_package_box` 在多个候选凸四边形里挑选"封口贴所在的正面"时
+  作为打分项之一（详见 §5.7）。落入区间得满分加分，落外按距离扣分。
+- `None` 表示该 LOB 不约束（如 Accy. 类目尺寸差异大）。
+
+数值取自实测数据：iPhone 包装盒 ≈ 1.7~2.2、Watch 长条 ≈ 3~4、AirPods 接近
+正方形 ≈ 1.0~1.1、iPad ≈ 1.3~1.5、MacBook 棕盒 ≈ 1.4~1.7。区间设计在实测
+中位数附近留 0.2~0.3 缓冲，避免边缘命中被误扣分。
 
 `scan_sticker` / `auth_sticker` 两种写法：
 
@@ -387,10 +414,15 @@ LOB_CONFIGS = {
  ├─ Phase 2  取盒子占比最大的候选图
  │
  ├─ Phase 2.5  包装盒透视矫正（三级降级，见下方 mermaid）
- │             rectify_package_box(image, lob=...)
+ │             rectify_package_box(image, lob=..., scan_polys_orig=...)
  │               → warped_img / M / (W_rect, H_rect) / method / box_quad_src
- │             策略 1/2 不分 LOB，策略 3（axis_aligned 兜底）按 LOB 调用
- │             detect_box_bbox(lob=...) 分流白/棕盒阈值
+ │             【策略 1 升级为：多候选凸四边形 + 正面打分挑选 ——
+ │              见 §5.7。Mac 同时跑 _find_quads_brown_split 棕盒分割路径
+ │              （见 §5.1.3），把"正面/顶面/侧面"分别成为独立候选。】
+ │             策略 1 用「含扫码即领文字框 + 长宽比命中正面区间 + 面积」
+ │              三项综合打分挑出真正的封口贴正面，再走 warpPerspective。
+ │             策略 2/3 与原行为一致；策略 3（axis_aligned 兜底）按 LOB
+ │              调用 detect_box_bbox(lob=...) 分流白/棕盒阈值。
  │             通过 cv2.perspectiveTransform 把原图 OCR 多边形映射到矫正坐标系
  │             无 M（axis_aligned 兜底）时退化为现有 (rel = (cx-box_x)/box_w) 公式
  │
@@ -416,9 +448,13 @@ LOB_CONFIGS = {
 
 ```mermaid
 flowchart LR
-    A[原图] --> B[detect_box_quad<br/>Canny + approxPolyDP]
-    B -->|4 点凸四边形<br/>面积比 ≥ 8% 通过| C[getPerspectiveTransform<br/>warpPerspective]
-    B -->|退化 / 非四边形| D[minAreaRect<br/>旋转矫正]
+    A[原图] --> B[_find_box_quads<br/>多候选凸四边形]
+    B --> B1[_find_quads_canny<br/>Canny + approxPolyDP / minAreaRect 兜底]
+    B --> B2["_find_quads_brown_split<br/>仅 Mac：HSV 棕色掩码 + 内部折线分割"]
+    B1 --> P[_pick_front_quad<br/>正面打分挑选]
+    B2 --> P
+    P -->|含扫码即领 + 长宽比命中<br/>+ 面积 tie-breaker| C[getPerspectiveTransform<br/>warpPerspective]
+    P -->|候选为空 / 全部分数极低| D[minAreaRect<br/>旋转矫正]
     D -->|最小外接矩形失败| E[axis_aligned<br/>现行 bbox]
     C --> F[矫正坐标系<br/>W_rect × H_rect]
     D --> F
@@ -431,6 +467,11 @@ flowchart LR
 > 动机：Watch / Mac 等版本迭代会改变盒子物理尺寸；斜视/旋转拍摄会让轴对齐 bbox
 > 把桌面背景纳入，导致 `rel_x / rel_y` 严重失真。统一矫正为正视矩形后，贴纸相对
 > 位置仅依赖于 LOB 规范，不再受拍摄姿态影响。
+>
+> **本版增量**：策略 1 不再"取面积最大的四边形当包装盒"，而是先枚举多个候选面，
+> 再用 LOB 正面长宽比 + "扫码即领"文字框落点综合打分。修掉两类典型误判：
+> ① AirPods 远拍小盒被原 0.20 占比一刀切过滤（参见 §3 `BOX_FRONTAL_MIN_RATIO`）；
+> ② Mac 立体盒拍摄时正面/侧面/顶面被合并成一个外包络四边形，rel 坐标系失真。
 
 ---
 
@@ -506,6 +547,48 @@ def _detect_brown_box(zone, cfg):
 所有 LOB 在 `enabled=True` 时，颜色命中仍然硬判 `position_valid=4`，
 保持硬判语义一致。若需运营上先软标记观察，可在 `LOB_CONFIGS` 中关闭 `enabled`
 逐 LOB 灰度放开。
+
+#### 5.1.3 Mac 棕盒分割补充检测路径（`_find_quads_brown_split`）
+
+`_find_box_quads` 在 `lob == "Mac"` 时**额外**跑一次棕盒分割路径，跟通用
+Canny 路径并行得到候选，再合并去重。设计动机：
+
+- Mac 包装是棕色瓦楞纸盒，**Canny+膨胀**在低对比度的棕色面之间无法区分边界，
+  门店立体拍摄（同时露出正面+顶面+侧面）时常把所有面合并成一个**外包络
+  四边形**。这个外包络 rel_x/rel_y 完全失真——贴纸相对它的"中心位置"
+  和相对单一面的"中心位置"差距甚远。
+- 实测 row738_img2（Mac 立体盒）：通用路径只能产出"几乎整张图"的外包络
+  （bbox 3621x3560，长宽比 1.02）；棕盒分割路径在外包络内部用敏感 Canny
+  把折线检测出来，bitwise 切分后能拿到独立的正面（bbox 2403x2778，
+  长宽比 1.17，命中 Mac 正面区间 1.2~2.0）。
+
+实现要点：
+
+```python
+def _find_quads_brown_split(img_cv, ...):
+    # ① HSV 棕色 inRange + 形态学闭/开运算 → 盒子主体掩码
+    brown_mask = cv2.inRange(hsv, BROWN_HSV_LOW, BROWN_HSV_HIGH)
+    brown_mask = morph_close + morph_open
+
+    # ② 取最大棕色连通区作为"盒子主体"区域
+    largest_contour = max(findContours(brown_mask), key=area)
+    box_mask = drawContours(largest_contour, fill=255)
+
+    # ③ 在主体内部做敏感 Canny（5, 25 而非通用路径的 20, 80）→ 内部折线
+    inner_edges = cv2.Canny(filtered_gray, 5, 25)
+    inner_edges[box_mask == 0] = 0
+
+    # ④ 折线膨胀作为"分割线"切分主体 → 子面
+    edges_dil = cv2.dilate(inner_edges, k5, iterations=2)
+    sub_mask = bitwise_and(box_mask, bitwise_not(edges_dil))
+
+    # ⑤ 每个子面用 _quad_from_contour（approxPolyDP / minAreaRect 兜底）
+    return [quad for cnt in subContours]
+```
+
+对 iPhone/iPad/AirPods/Accy./Watch（白盒）不启用此路径——白盒 Canny 通用路径
+已经足够。`_dedup_quads` 在合并通用+棕盒两路结果时按中心点距离去重，避免
+近似重复候选互相抢分。
 
 ### 5.2 Watch 双封口
 
@@ -624,6 +707,81 @@ y_ok = y_lo <= rel_cy <= y_hi
 - `_scan_sticker_distance_to_zone` 取到所有区域距离的最小值，保证
   `pick_best_scan_sticker` 选贴策略与多区域业务语义一致
 
+### 5.7 包装盒矫正：多候选凸四边形 + 正面打分挑选
+
+**背景问题**：旧版 `_find_box_quad` 在矫正阶段只取"面积最大的凸四边形"。
+两类典型误判：
+
+1. **AirPods 小盒+远拍**：盒子主轮廓 area_ratio 不算小（5%~15%），但因为
+   边角磨圆+阴影不规则，`approxPolyDP` 在所有 eps 里都拟合不到 4 凸点（典型
+   是 5~6 凹点）。旧实现直接返回 None，再加上原 `BOX_FRONTAL_MIN_RATIO=0.20`
+   占比阈值，整张图被丢弃。
+2. **Mac 立体盒**：Canny 把"盒子+背景反光"合并成单一外包络，强行 approxPolyDP
+   后得到一个长宽比偏离正面的"假四边形"，rel_x/rel_y 完全失真。
+
+**新实现**：`_find_box_quads`（注意复数）→ `_pick_front_quad`，参考代码：
+
+```python
+quads = _find_box_quads(img_cv, lob=lob)
+# Mac 时同时跑通用 + 棕盒分割两路（§5.1.3），合并去重
+quad = _pick_front_quad(quads, scan_centers_orig, aspect_range, img_area)
+```
+
+#### 5.7.1 多候选生成（`_find_box_quads`）
+
+通用 `_find_quads_canny` 路径：
+
+```python
+for cnt in contours[:25]:
+    if area < min_area_ratio * dW * dH:    # min_area_ratio=0.03
+        continue
+    quad = _quad_from_contour(cnt)           # 优先 approxPolyDP，兜底 minAreaRect
+    if quad: quads.append(quad)
+```
+
+`_quad_from_contour` 关键升级：**当 approxPolyDP 在所有 eps 下都拟合不到
+4 凸点时，用 `cv2.minAreaRect` 的最小外接旋转矩形 4 角点兜底**。AirPods/Mac
+这类边角磨圆 + 阴影边缘场景由此可以稳定拿到候选四边形。
+
+#### 5.7.2 正面打分（`_score_quad`）
+
+```python
+def _score_quad(quad, scan_centers_orig, aspect_range, img_area):
+    # ── 信号 1（最强）：四边形是否包住任意"扫码即领"文字框中心 ──
+    #   命中 → +2.0；不命中 → 0
+    contain_score = 2.0 if any pointPolygonTest(quad, c) >= 0 else 0.0
+
+    # ── 信号 2：长宽比是否落入 LOB 正面区间 ──
+    #   完美命中区间 → +1.5；区间外按欧氏距离扣分（每偏 1.0 扣 0.6，下限 0）
+    aspect_score = 1.5 if lo <= aspect <= hi else max(0, 1.0 - dist*0.6)
+
+    # ── 信号 3（tie-breaker）：面积越大越好，sqrt 抑制规模膨胀 ──
+    #   权重 0.15，避免外包络仅靠"大"压过真正的正面
+    area_score = 0.15 * sqrt(area / img_area)
+
+    return contain_score + aspect_score + area_score
+```
+
+权重设计经过 row5（AirPods 远拍）/ row395（Mac 平躺）/ row738（Mac 立体）实测调参：
+
+- **`contain_score=2.0` 是最强信号**：封口贴必在正面，正面必含扫码即领。
+- **`aspect_score` 命中区间得 1.5**（高于 area_score 满分 0.15 一个数量级）：
+  解决"两个候选都含扫码"时（典型如 Mac 立体盒外包络 + 棕盒分割正面）
+  让"长宽比刚好正面"显著领先于"长宽比偏出但稍大"。
+- **`area_score` 仅 tie-breaker**（系数 0.15）：避免外包络面积大但语义错误。
+
+`scan_polys_orig` 来源：`process_row` 在调 `rectify_package_box` 前，从
+Phase 1 已经拿到的 `best.texts/polys_orig` 里筛出"扫码即领"对应的多边形传入；
+没有扫码即领文字时（罕见，但兜底）打分退化为长宽比 + 面积，仍能选出合理的面。
+
+#### 5.7.3 实测效果（基于 `小程序封口贴QTD.xlsx` 标绿样本）
+
+| 场景 | 旧实现 | 新实现 |
+|---|---|---|
+| AirPods row5_img2 远拍小盒 | 整图被 0.20 占比过滤，detail="无正向完整照片" | 占比放松到 0.02 + minAreaRect 兜底 → 正面（长宽比 1.06）正确选中 |
+| Mac row738_img2 立体盒 | 单一外包络（长宽比 1.02，几乎整张图） | 棕盒分割路径补充候选，正面（长宽比 1.17）打分 3.06 ＞ 外包络 3.02 |
+| Mac row395_img1 平躺正面 | 同左侧 | 4 候选中正面（1.18 含扫码）打分 3.06 选中 |
+
 ---
 
 ## 六、LOB 识别方式（严格模式）
@@ -687,9 +845,29 @@ return key if key in LOB_CONFIGS else "UNKNOWN LOB"
 - 异常：`"位置异常：X=1.25 不在 [0.5,0.95]±0.15"`
 - Watch 多区域异常：`"位置异常 (多区域任一)：Y=0.50 不在 [0.55,1.00]±0.15"`
 
+### 7.1 `dual_code = 2`（两个扫码即领）的判定调整
+
+业务约定：两个"扫码即领"虽然不规范（应为扫码 + Apple授权专营店），
+**但已贴上封口贴的事实成立**——把"是否规范粘贴=1"，`封口贴存在=1`，
+`贴纸位置规范=1`，`双贴纸状态=2` 保留作为人工抽检/筛选标记。
+
+| 列                | 旧值（视为不合规） | 新值（视为合规）   |
+| ----------------- | ----------- | ----------- |
+| `是否规范粘贴`     | 0           | **1**       |
+| `封口贴存在`       | 1           | 1           |
+| `贴纸位置规范`     | 1           | 1           |
+| `双贴纸状态`       | 2           | 2（含义不变） |
+
+主流程 `process_row` 命中 `dual["dual_code"] == 2` 时直接返回 `is_compliant=1`；
+`main()` 末尾汇总输出把"两个扫码贴"从"不合规清单"挪到"合规-子项"展示。
+
 ---
 
 ## 八、各 LOB 合规判定逻辑总结
+
+> **两个扫码贴**（`dual_code = 2`，scan_count ≥ 2）业务约定按"已贴上封口贴"
+> **统一计入合规** —— 见 §7.1。下方各 LOB 公式里的"无双扫码错误"已不再
+> 作为否决条件，仅在 `双贴纸状态` 列保留 `2` 作为抽检标记。
 
 ### iPhone / iPad
 
@@ -698,9 +876,9 @@ return key if key in LOB_CONFIGS else "UNKNOWN LOB"
   AND 角度合规
   AND 未平铺
   AND （无二贴 OR 二贴位置合规（右下角））
-  AND 无双扫码错误
   AND 无非官方贴纸
 → 合规
+（两个扫码贴 dual_code=2 仍计入合规，仅作抽检标记）
 ```
 
 ### Watch
@@ -710,9 +888,9 @@ return key if key in LOB_CONFIGS else "UNKNOWN LOB"
   AND 角度合规
   AND 未平铺
   AND （无二贴 OR 二贴位置合规（另一端或同样允许顶端/底端）)
-  AND 无双扫码错误
   AND 无非官方贴纸
 → 合规
+（两个扫码贴 dual_code=2 仍计入合规，仅作抽检标记）
 ```
 
 ### AirPods / 原厂配件
@@ -723,7 +901,7 @@ return key if key in LOB_CONFIGS else "UNKNOWN LOB"
   AND 未平铺
   AND 无非官方贴纸
 → 合规
-（跳过所有双贴检测）
+（跳过所有双贴检测；single_only 模式下两张扫码仍判不合规）
 ```
 
 ### Mac
@@ -733,8 +911,25 @@ return key if key in LOB_CONFIGS else "UNKNOWN LOB"
   AND 角度合规
   AND 未平铺
   AND （无二贴 OR 二贴位置合规（上方靠左））
-  AND 无双扫码错误
   AND 无非官方贴纸
 → 合规
+（两个扫码贴 dual_code=2 仍计入合规，仅作抽检标记）
 ```
+
+---
+
+## 九、版本变更摘要（2026-04-29）
+
+本次围绕"AirPods 远拍小盒"+"Mac 立体盒拍摄"两类典型误判做了系统性改造。
+主要变更点（附实现位置）：
+
+| # | 变更 | 实现位置 | 章节 |
+|---|---|---|---|
+| 1 | `BOX_FRONTAL_MIN_RATIO`: 0.20 → 0.02（盒子坐标系归一化已消除"盒子大小"变量） | `ocr_batch_process_v2.py` 顶部常量 | §3 |
+| 2 | `LOB_CONFIGS` 每个 LOB 新增 `front_face_aspect_range` 字段 | `LOB_CONFIGS` | §3 |
+| 3 | `_find_box_quad`（单候选）→ `_find_box_quads`（多候选），approxPolyDP 拟合不到 4 凸点时用 `minAreaRect` 兜底 | `_find_quads_canny` + `_quad_from_contour` | §5.7.1 |
+| 4 | Mac 专用棕盒分割补充检测路径，HSV 棕色掩码 + 内部敏感 Canny 切分子面 | `_find_quads_brown_split` + `_dedup_quads` | §5.1.3 |
+| 5 | "正面打分挑选"：含扫码即领 (2.0) + 长宽比命中区间 (1.5) + 面积 tie-breaker (0.15) | `_score_quad` + `_pick_front_quad` | §5.7.2 |
+| 6 | `rectify_package_box(..., scan_polys_orig=...)`：把"扫码即领"原图多边形传入，让矫正阶段也能用此最强信号 | `rectify_package_box` 签名扩展 | §4 |
+| 7 | `dual_code == 2`（两个扫码即领）改判**合规** | `process_row` Phase 4 + `main()` 统计 | §7.1 / §8 |
 

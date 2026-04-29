@@ -1977,8 +1977,11 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
     )
 
     if dual["dual_code"] == 2:
+        # 业务约定：两个"扫码即领"虽然不规范（应为扫码 + Apple授权专营店），
+        # 但已贴上封口贴 → 仍按"是否规范粘贴=1"计入合规，dual_code 保留 2
+        # 供事后人工抽检/筛选；位置规范也保持 1。
         result = _make_result(
-            is_compliant=0, seal_exists=1, position_valid=1,
+            is_compliant=1, seal_exists=1, position_valid=1,
             rel_x=placement["rel_x"], rel_y=placement["rel_y"],
             box_method=best["box_method"], detail=placement["detail"],
             dual_code=2, dual_detail=dual["dual_detail"],
@@ -2228,6 +2231,7 @@ def main():
         for rm, cnt in df_final['矫正方式'].value_counts(dropna=False).items():
             print(f"  {rm}: {cnt}")
     print(f"是否规范粘贴 ✓ 合规    : {cnt_compliant} 行")
+    print(f"  └─ 其中两个扫码贴    : {cnt_dual_err} 行  (按规范粘贴计入，仅供抽检)")
     print(f"是否规范粘贴 ✗ 不合规  : {cnt_fail} 行")
     print(f"  ├─ 无正向完整照片    : {cnt_no_frontal} 行")
     print(f"  ├─ 无封口贴          : {cnt_no_seal} 行")
@@ -2235,7 +2239,6 @@ def main():
     print(f"  ├─ 角度异常          : {cnt_angle_bad} 行  (偏角 > {STICKER_ANGLE_MAX_DEG:.0f}°)")
     print(f"  ├─ 平铺错误          : {cnt_flat} 行  (端片未绕侧面)")
     print(f"  ├─ 非官方贴纸        : {cnt_unofficial} 行  (经销商彩色自贴)")
-    print(f"  ├─ 双贴纸错误        : {cnt_dual_err} 行  (两个扫码贴)")
     print(f"  └─ 缺失二贴          : {cnt_dual_miss} 行  (dual_required)")
     print(f"双贴纸合规             : {cnt_dual_ok} 行  (扫码+授权专营)")
     print(f"总耗时                 : {(time.time() - start_time) / 3600:.2f} 小时")

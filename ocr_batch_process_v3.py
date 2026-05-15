@@ -43,7 +43,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 
 # ─── 可调参数 ────────────────────────────────────────────────────────────────
-IMAGE_COLUMNS    = ['图片地址', 'Unnamed: 17', 'Unnamed: 18', 'Unnamed: 19']
+IMAGE_COLUMNS    = ['图片地址', 'Unnamed: 16', 'Unnamed: 17', 'Unnamed: 18', 'Unnamed: 19', 'Unnamed: 20', 'Unnamed: 21', 'Unnamed: 22']
 DOWNLOAD_WORKERS = 8
 
 # 位置容差（相对坐标系）：封口贴绕折超出包装盒边界仍算合规

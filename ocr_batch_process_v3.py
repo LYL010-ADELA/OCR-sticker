@@ -132,8 +132,16 @@ LOB_CONFIGS: dict[str, dict] = {
     },
     "Mac": {
         "sticker_count": "single_or_dual",
-        "scan_sticker": {"x_min": 0.25, "x_max": 0.75, "y_min": 0.70, "y_max": 1.00},
-        "auth_sticker": {"x_min": 0.05, "x_max": 0.50, "y_min": 0.00, "y_max": 0.30},
+        # 扫码即领：下方居中 或 上方居中（镜像）均合规
+        "scan_sticker": [
+            {"x_min": 0.25, "x_max": 0.75, "y_min": 0.70, "y_max": 1.00},
+            {"x_min": 0.25, "x_max": 0.75, "y_min": 0.00, "y_max": 0.30},
+        ],
+        # Apple授权专营店：上方左侧 或 上方右侧（镜像）均合规
+        "auth_sticker": [
+            {"x_min": 0.05, "x_max": 0.50, "y_min": 0.00, "y_max": 0.30},
+            {"x_min": 0.50, "x_max": 0.95, "y_min": 0.00, "y_max": 0.30},
+        ],
         "front_face_aspect_range": (1.2, 2.0),
         "unofficial_color": {
             "enabled": True, "mode": "brown_box",

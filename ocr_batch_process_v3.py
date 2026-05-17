@@ -59,9 +59,16 @@ BOX_FRONTAL_MIN_RATIO = 0.02
 # 非官方贴纸颜色检测阈值
 UNOFFICIAL_SAT_ABOVE_BG  = 55
 UNOFFICIAL_VAL_RANGE     = (40, 230)
-UNOFFICIAL_AREA_RATIO    = 0.015
+UNOFFICIAL_AREA_RATIO    = 0.020      # V3.1: 1.5% → 2.0%，减少边界误判
 UNOFFICIAL_SOLIDITY_MIN  = 0.45
 UNOFFICIAL_EDGE_GRAD_MIN = 6.0
+
+# 白色背景最少像素数：低于此值说明拍照条件较差，无法可靠建立白平衡基准
+UNOFFICIAL_WHITE_BG_MIN  = 800
+
+# 官方印刷关键词：这些区域包含官方盒面印刷彩色元素，颜色检测时排除
+# AirPods 盒子右侧紫色"Apple授权专营店 在你身边"条带是典型误触发来源
+OFFICIAL_PRINT_KEYWORDS  = ["Apple授权专营店", "在你身边", "授权专营店"]
 
 # 棕色瓦楞纸盒 HSV 范围（Mac 专用）
 BROWN_HSV_LOW  = (5,  30, 40)
@@ -703,7 +710,17 @@ def _filter_color_candidates(candidate_mask, signal_u8, zone_area, color_cfg, de
     return False, ""
 
 
-def _detect_unofficial_white_box(zone, color_cfg):
+def _detect_unofficial_white_box(zone, color_cfg, full_zone_area=None):
+    """
+    白盒分支：白平衡归一化 + 相对饱和度。
+
+    改进（V3.1）：
+      1. 白色背景像素不足时跳过检测，避免拍摄条件差时的误判
+      2. full_zone_area：面积比例始终相对整个 box zone 计算，
+         而非相对当前检测窗口（ROI）。这样即使只检测贴纸附近的小 ROI，
+         盒面其他角落的官方印刷元素（紫色条带、绿色回收箭头等）因占
+         全盒面积极小（< 2%），不会触发阈值。
+    """
     sat_above_bg = float(color_cfg.get("sat_above_bg", UNOFFICIAL_SAT_ABOVE_BG))
     v_min, v_max = color_cfg.get("val_range", UNOFFICIAL_VAL_RANGE)
 
@@ -712,12 +729,21 @@ def _detect_unofficial_white_box(zone, color_cfg):
     v_raw = hsv_f[:, :, 2]
 
     white_mask = (v_raw > 180) & (s_raw < 55)
-    bg_sat_ref = float(np.percentile(s_raw[white_mask], 90)) if white_mask.sum() > 200 else 0.0
+    white_count = int(white_mask.sum())
+
+    # 白色背景像素不足 → 无法可靠建立白平衡基准，跳过
+    if white_count < UNOFFICIAL_WHITE_BG_MIN:
+        return False, f"白色背景像素不足({white_count}px)，跳过颜色检测"
+
+    bg_sat_ref = float(np.percentile(s_raw[white_mask], 90))
     eff_sat = np.clip(s_raw - bg_sat_ref - 10.0, 0.0, 255.0)
 
     candidate = ((eff_sat > sat_above_bg) & (v_raw > v_min) & (v_raw < v_max)).astype(np.uint8) * 255
+
     eff_sat_u8 = np.clip(eff_sat, 0, 255).astype(np.uint8)
-    return _filter_color_candidates(candidate, eff_sat_u8, zone.shape[0] * zone.shape[1],
+    # 面积比例基准：优先用整个 zone 面积，避免 ROI 检测时分母偏小导致误判
+    base_area = full_zone_area if full_zone_area else zone.shape[0] * zone.shape[1]
+    return _filter_color_candidates(candidate, eff_sat_u8, base_area,
                                     color_cfg, f"[white_box] 非白色彩色区域 (bg_ref S={bg_sat_ref:.1f})")
 
 
@@ -744,7 +770,30 @@ def _detect_unofficial_brown_box(zone, color_cfg):
                                     color_cfg, "[brown_box] 非棕非白高饱和异色区域")
 
 
-def detect_unofficial_sticker_color(warped_img, color_cfg) -> tuple[bool, str]:
+def detect_unofficial_sticker_color(
+    warped_img,
+    color_cfg,
+    polys_rect=None,
+    texts=None,
+) -> tuple[bool, str]:
+    """
+    非官方贴纸颜色检测。
+
+    策略（V3.1）：
+      非官方贴纸必然贴在"扫码即领"官方贴纸的位置（替换/遮盖它）。
+      因此只在扫码即领贴纸的邻域内检测彩色区域，彻底忽略盒面其他区域
+      （如 AirPods 紫色授权条带、绿色回收箭头等官方印刷元素）。
+
+      流程：
+        1. 在 polys_rect/texts 中找到"扫码即领"（或同义词）的中心点
+        2. 以该中心为基准，取 ±SCAN_ROI_HALF（相对于 zone 尺寸）的矩形 ROI
+        3. 只在 ROI 内做颜色检测
+        4. 若找不到贴纸中心，回退到全图检测（兼容旧行为）
+
+    参数：
+      polys_rect : OCR 多边形坐标列表（矫正坐标系），与 texts 对齐
+      texts      : OCR 文字列表
+    """
     if not color_cfg or not color_cfg.get("enabled", False):
         return False, "颜色检测已跳过"
     try:
@@ -757,9 +806,49 @@ def detect_unofficial_sticker_color(warped_img, color_cfg) -> tuple[bool, str]:
         zone = warped_img[my:H - my, mx:W - mx]
         if zone.shape[0] < 10 or zone.shape[1] < 10:
             return False, ""
+
+        zH, zW = zone.shape[:2]
+
+        # 尝试定位"扫码即领"贴纸中心 → 构建 ROI 检测窗口
+        # 非官方贴纸只可能出现在官方贴纸位置，其他区域的彩色元素均为盒面印刷
+        roi_zone = None
+        roi_label = ""
+        if polys_rect and texts:
+            scan_center_x, scan_center_y = None, None
+            for i, text in enumerate(texts):
+                if "扫码即领" in text and i < len(polys_rect):
+                    try:
+                        pts = np.array(polys_rect[i], dtype=np.float32)
+                        cx = float(pts[:, 0].mean()) - mx
+                        cy = float(pts[:, 1].mean()) - my
+                        if 0 <= cx <= zW and 0 <= cy <= zH:
+                            scan_center_x, scan_center_y = cx, cy
+                            break
+                    except Exception:
+                        pass
+
+            if scan_center_x is not None:
+                # ROI 半径 = zone 短边的 30%（覆盖贴纸及其周围）
+                half = int(min(zH, zW) * 0.30)
+                x1 = max(0, int(scan_center_x) - half)
+                x2 = min(zW, int(scan_center_x) + half)
+                y1 = max(0, int(scan_center_y) - half)
+                y2 = min(zH, int(scan_center_y) + half)
+                roi_zone = zone[y1:y2, x1:x2]
+                roi_label = f" (贴纸ROI x={x1}-{x2}, y={y1}-{y2})"
+
+        target = roi_zone if (roi_zone is not None and roi_zone.size > 0) else zone
+        if target.shape[0] < 10 or target.shape[1] < 10:
+            return False, ""
+
+        full_zone_area = zH * zW  # 面积比例始终相对整个 zone，而非 ROI
+
         if color_cfg.get("mode") == "brown_box":
-            return _detect_unofficial_brown_box(zone, color_cfg)
-        return _detect_unofficial_white_box(zone, color_cfg)
+            return _detect_unofficial_brown_box(target, color_cfg)
+        flag, detail = _detect_unofficial_white_box(target, color_cfg, full_zone_area=full_zone_area)
+        if roi_label and detail:
+            detail = detail + roi_label
+        return flag, detail
     except Exception as e:
         return False, f"颜色检测异常: {type(e).__name__}: {e}"
 
@@ -1193,7 +1282,15 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
 
     print(f"  矫正方式: {rect_method}  矫正尺寸: {W_rect}×{H_rect}")
 
-    # Phase 2.5: 非官方贴纸颜色检测（仅对背面图）
+    # Phase 2.5: 将 OCR 多边形提前映射到矫正坐标系
+    # （提前到颜色检测前，供排除官方印刷区域掩码使用）
+    polys_rect = transform_polys(
+        back["polys_orig"], M,
+        box_x=rectify["box_x"] if M is None else 0,
+        box_y=rectify["box_y"] if M is None else 0,
+    )
+
+    # Phase 2.6: 非官方贴纸颜色检测（仅对背面图，排除官方印刷文字区域）
     unofficial_sticker = 0
     color_checked      = 0
     color_mode         = ""
@@ -1201,7 +1298,10 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
     if color_cfg.get("enabled", False):
         color_mode    = color_cfg.get("mode", "white_box")
         color_checked = 1
-        has_unoff, unoff_detail = detect_unofficial_sticker_color(warped_img, color_cfg)
+        has_unoff, unoff_detail = detect_unofficial_sticker_color(
+            warped_img, color_cfg,
+            polys_rect=polys_rect, texts=back["texts"],
+        )
         if has_unoff:
             unofficial_sticker = 1
             print(f"  ⚠ 颜色检测命中非官方贴纸：{unoff_detail}")
@@ -1223,12 +1323,7 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
         print(f"  颜色检测：LOB={lob} enabled=False，跳过")
 
     # Phase 3: 位置验证（放宽容差 {STICKER_POSITION_TOLERANCE}，无角度约束）
-    polys_rect = transform_polys(
-        back["polys_orig"], M,
-        box_x=rectify["box_x"] if M is None else 0,
-        box_y=rectify["box_y"] if M is None else 0,
-    )
-
+    # polys_rect 已在 Phase 2.5 计算完毕
     scan_candidates = find_all_scan_stickers(back["texts"], polys_rect)
     sticker_rect    = pick_best_scan_sticker(scan_candidates, W_rect, H_rect, scan_cfg)
 

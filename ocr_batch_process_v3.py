@@ -59,7 +59,7 @@ BOX_FRONTAL_MIN_RATIO = 0.02
 # 非官方贴纸颜色检测阈值
 UNOFFICIAL_SAT_ABOVE_BG  = 55
 UNOFFICIAL_VAL_RANGE     = (40, 230)
-UNOFFICIAL_AREA_RATIO    = 0.020      # V3.1: 1.5% → 2.0%，减少边界误判
+UNOFFICIAL_AREA_RATIO    = 0.05       # V3.1: 默认 5%（非 AirPods 白盒）
 UNOFFICIAL_SOLIDITY_MIN  = 0.45
 UNOFFICIAL_EDGE_GRAD_MIN = 6.0
 
@@ -84,7 +84,7 @@ LOB_CONFIGS: dict[str, dict] = {
         "unofficial_color": {
             "enabled": True, "mode": "white_box",
             "sat_above_bg": 55, "val_range": (40, 230),
-            "area_ratio": 0.020, "solidity_min": 0.45, "edge_grad_min": 6.0,
+            "area_ratio": 0.05, "solidity_min": 0.45, "edge_grad_min": 6.0,
         },
     },
     "Watch": {
@@ -101,7 +101,7 @@ LOB_CONFIGS: dict[str, dict] = {
         "unofficial_color": {
             "enabled": True, "mode": "white_box",
             "sat_above_bg": 55, "val_range": (40, 230),
-            "area_ratio": 0.020, "solidity_min": 0.45, "edge_grad_min": 6.0,
+            "area_ratio": 0.05, "solidity_min": 0.45, "edge_grad_min": 6.0,
         },
     },
     "AirPods": {
@@ -125,7 +125,7 @@ LOB_CONFIGS: dict[str, dict] = {
         "unofficial_color": {
             "enabled": True, "mode": "white_box",
             "sat_above_bg": 55, "val_range": (40, 230),
-            "area_ratio": 0.020, "solidity_min": 0.45, "edge_grad_min": 6.0,
+            "area_ratio": 0.05, "solidity_min": 0.45, "edge_grad_min": 6.0,
         },
     },
     "iPad": {
@@ -136,7 +136,7 @@ LOB_CONFIGS: dict[str, dict] = {
         "unofficial_color": {
             "enabled": True, "mode": "white_box",
             "sat_above_bg": 55, "val_range": (40, 230),
-            "area_ratio": 0.020, "solidity_min": 0.45, "edge_grad_min": 6.0,
+            "area_ratio": 0.05, "solidity_min": 0.45, "edge_grad_min": 6.0,
         },
     },
     "Mac": {
@@ -157,7 +157,7 @@ LOB_CONFIGS: dict[str, dict] = {
             "brown_hue_range": (5, 30), "brown_sat_min": 30,
             "brown_val_range": (40, 200), "white_sat_max": 30,
             "white_val_min": 200, "sat_min_abs": 80,
-            "val_range": (50, 240), "area_ratio": 0.020,
+            "val_range": (50, 240), "area_ratio": 0.05,
             "solidity_min": 0.45, "edge_grad_min": 6.0,
         },
     },

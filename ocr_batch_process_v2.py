@@ -2383,10 +2383,10 @@ def _print_summary(r: dict):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    input_file   = '/home/ubuntu/OCR/出库照片_商派小程序_W1W2W4_top2850.xlsx'
-    output_csv   = '/home/ubuntu/OCR/出库照片_商派小程序_W1W2W4_top2850_results.csv'
-    output_json  = '/home/ubuntu/OCR/出库照片_商派小程序_W1W2W4_top2850_results.jsonl'
-    output_excel = '/home/ubuntu/OCR/出库照片_商派小程序_W1W2W4_top2850_processed.xlsx'
+    input_file   = '/home/ubuntu/OCR/W5.xlsx'
+    output_csv   = '/home/ubuntu/OCR/W5_results.csv'
+    output_json  = '/home/ubuntu/OCR/W5_results.jsonl'
+    output_excel = '/home/ubuntu/OCR/W5_processed.xlsx'
 
     NEW_COLS = [
         '识别LOB',          # iPhone / Watch / AirPods / Accy. / iPad / Mac

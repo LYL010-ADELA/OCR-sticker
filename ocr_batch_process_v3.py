@@ -44,7 +44,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 # ─── 可调参数 ────────────────────────────────────────────────────────────────
 IMAGE_COLUMNS    = ['图片地址', 'Unnamed: 16', 'Unnamed: 17', 'Unnamed: 18', 'Unnamed: 19', 'Unnamed: 20', 'Unnamed: 21', 'Unnamed: 22']
-DOWNLOAD_WORKERS = 8
+DOWNLOAD_WORKERS = 12
 
 # 位置容差（相对坐标系）：封口贴绕折超出包装盒边界仍算合规
 # V3 放宽：0.15 → 0.25
@@ -269,9 +269,7 @@ def ocr_image_full(image: Image.Image, image_id: str = "unknown"):
         image_resized = resize_for_ocr(image, max_side=2000)
         res_w, res_h = image_resized.size
 
-        temp_path = f"/tmp/temp_ocr_{image_id}_{int(time.time() * 1000)}.jpg"
-        image_resized.save(temp_path, 'JPEG')
-        result = ocr.predict(input=temp_path)
+        result = ocr.predict(input=pil_to_cv(image_resized))
 
         texts, polys_res = [], []
         if result and len(result) > 0:
@@ -280,9 +278,6 @@ def ocr_image_full(image: Image.Image, image_id: str = "unknown"):
                 res = ocr_result.json.get('res', {})
                 texts = res.get('rec_texts', [])
                 polys_res = res.get('dt_polys', res.get('boxes', []))
-
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
 
         sx = orig_w / res_w if res_w > 0 else 1.0
         sy = orig_h / res_h if res_h > 0 else 1.0
@@ -295,8 +290,6 @@ def ocr_image_full(image: Image.Image, image_id: str = "unknown"):
     except Exception as e:
         print("  OCR 识别异常:", type(e).__name__, repr(e))
         print(traceback.format_exc())
-        if 'temp_path' in locals() and os.path.exists(temp_path):
-            os.remove(temp_path)
         return "", [], [], 0, 0
 
 
@@ -1058,16 +1051,12 @@ def extract_watermark_crop(image: Image.Image, image_id: str) -> tuple[str, str]
     try:
         w, h = image.size
         crop = image.crop((0, int(h * 0.82), int(w * 0.60), h))
-        temp_path = f"/tmp/wm_crop_{image_id}_{int(time.time() * 1000)}.jpg"
-        crop.save(temp_path, 'JPEG')
-        result = ocr.predict(input=temp_path)
+        result = ocr.predict(input=pil_to_cv(crop))
         texts = []
         if result and len(result) > 0:
             r = result[0]
             if hasattr(r, 'json'):
                 texts = r.json.get('res', {}).get('rec_texts', [])
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
         return parse_watermark_text(texts)
     except Exception as e:
         print("  水印OCR异常:", type(e).__name__, str(e)[:80])
@@ -1419,10 +1408,10 @@ def _print_summary(r: dict):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    input_file   = '/home/ubuntu/OCR/W5.xlsx'
-    output_csv   = '/home/ubuntu/OCR/W5_v3_results.csv'
-    output_json  = '/home/ubuntu/OCR/W5_v3_results.jsonl'
-    output_excel = '/home/ubuntu/OCR/W5_v3_processed.xlsx'
+    input_file   = '/home/ubuntu/OCR/MP&Eleme W8.xlsx'
+    output_csv   = '/home/ubuntu/OCR/MP&Eleme W8_results.csv'
+    output_json  = '/home/ubuntu/OCR/MP&Eleme W8_results.jsonl'
+    output_excel = '/home/ubuntu/OCR/MP&Eleme W8_processed.xlsx'
 
     NEW_COLS = [
         '识别LOB',             # iPhone / Watch / AirPods / Accy. / iPad / Mac
@@ -1470,7 +1459,7 @@ def main():
     start_time  = time.time()
 
     # 流水线预下载（预取 3 行）
-    PREFETCH_ROWS = 3
+    PREFETCH_ROWS = 5
     prefetch_cache: dict[int, list] = {}
 
     def ensure_prefetched(target_pi: int):

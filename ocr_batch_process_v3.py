@@ -98,6 +98,9 @@ LOB_CONFIGS: dict[str, dict] = {
             {"y_min": 0.55, "y_max": 1.00},
         ],
         "front_face_aspect_range": (2.5, 5.0),
+        # Watch 盒子细长，贴纸字体偏小；短边低于阈值时主动放大再做 OCR
+        "ocr_max_side": 3000,
+        "ocr_min_short_side": 1200,
         "unofficial_color": {
             "enabled": True, "mode": "white_box",
             "sat_above_bg": 55, "val_range": (40, 230),
@@ -198,7 +201,7 @@ ocr = PaddleOCR(
     lang='ch',
     device='gpu',
     enable_mkldnn=False,
-    text_det_limit_side_len=2000,
+    text_det_limit_side_len=3000,   # 提升至 3000 以支持 Watch 高分辨率模式
 )
 print("PaddleOCR 初始化完成！\n")
 
@@ -213,13 +216,30 @@ def pil_to_cv(image_pil: Image.Image) -> np.ndarray:
     return cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
 
 
-def resize_for_ocr(image: Image.Image, max_side: int = 2000) -> Image.Image:
+def resize_for_ocr(image: Image.Image, max_side: int = 2000,
+                   min_short_side: int = 0) -> Image.Image:
+    """
+    缩放图片以送入 OCR。
+    - 若 min_short_side > 0 且短边不足，先用 LANCZOS 放大（保留细节），
+      再按 max_side 上限裁剪；适用于 Watch 等贴纸字体偏小的场景。
+    - 常规路径：仅缩小，不放大。
+    """
     if image is None:
         return None
     w, h = image.size
-    if max(w, h) <= max_side:
+    short, long_ = min(w, h), max(w, h)
+
+    if min_short_side > 0 and short < min_short_side:
+        scale = min_short_side / short
+        w2, h2 = max(1, int(w * scale)), max(1, int(h * scale))
+        if max(w2, h2) > max_side:
+            scale2 = max_side / max(w2, h2)
+            w2, h2 = max(1, int(w2 * scale2)), max(1, int(h2 * scale2))
+        return image.resize((w2, h2), resample=Image.LANCZOS)
+
+    if long_ <= max_side:
         return image
-    scale = max_side / max(w, h)
+    scale = max_side / long_
     return image.resize(
         (max(1, int(w * scale)), max(1, int(h * scale))),
         resample=Image.BICUBIC
@@ -261,12 +281,14 @@ def submit_row_downloads(row) -> list[tuple]:
 # 三、OCR
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def ocr_image_full(image: Image.Image, image_id: str = "unknown"):
+def ocr_image_full(image: Image.Image, image_id: str = "unknown",
+                   max_side: int = 2000, min_short_side: int = 0):
     if image is None:
         return "", [], [], 0, 0
     try:
         orig_w, orig_h = image.size
-        image_resized = resize_for_ocr(image, max_side=2000)
+        image_resized = resize_for_ocr(image, max_side=max_side,
+                                       min_short_side=min_short_side)
         res_w, res_h = image_resized.size
 
         result = ocr.predict(input=pil_to_cv(image_resized))
@@ -1137,11 +1159,13 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
         _print_summary(r)
         return r
 
-    lob_cfg   = LOB_CONFIGS[lob]
-    scan_cfg  = lob_cfg["scan_sticker"]
-    auth_cfg  = lob_cfg.get("auth_sticker")
-    color_cfg = lob_cfg.get("unofficial_color", {"enabled": False})
-    sc_mode   = lob_cfg.get("sticker_count", "single_or_dual")
+    lob_cfg         = LOB_CONFIGS[lob]
+    scan_cfg        = lob_cfg["scan_sticker"]
+    auth_cfg        = lob_cfg.get("auth_sticker")
+    color_cfg       = lob_cfg.get("unofficial_color", {"enabled": False})
+    sc_mode         = lob_cfg.get("sticker_count", "single_or_dual")
+    ocr_max_side    = int(lob_cfg.get("ocr_max_side", 2000))
+    ocr_min_short   = int(lob_cfg.get("ocr_min_short_side", 0))
 
     print(f"  LOB: {lob}  (sticker_count={sc_mode})")
 
@@ -1169,7 +1193,10 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
             print(f"  水印时间: {wm_time or '(未识别)'}")
             print(f"  水印地点: {wm_loc or '(未识别)'}")
 
-        full_text, texts, polys_orig, orig_h, orig_w = ocr_image_full(image, image_id)
+        full_text, texts, polys_orig, orig_h, orig_w = ocr_image_full(
+            image, image_id,
+            max_side=ocr_max_side, min_short_side=ocr_min_short,
+        )
         print(f"  识别文字: {full_text[:120]}{'...' if len(full_text) > 120 else ''}")
 
         if any("扫码即领" in t for t in texts):
@@ -1408,10 +1435,10 @@ def _print_summary(r: dict):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    input_file   = '/home/ubuntu/OCR/MP&Eleme W8.xlsx'
-    output_csv   = '/home/ubuntu/OCR/MP&Eleme W8_results.csv'
-    output_json  = '/home/ubuntu/OCR/MP&Eleme W8_results.jsonl'
-    output_excel = '/home/ubuntu/OCR/MP&Eleme W8_processed.xlsx'
+    input_file   = '/home/ubuntu/OCR/MP&eleme&MT W9.xlsx'
+    output_csv   = '/home/ubuntu/OCR/MP&eleme&MT W9_results.csv'
+    output_json  = '/home/ubuntu/OCR/MP&eleme&MT W9_results.jsonl'
+    output_excel = '/home/ubuntu/OCR/MP&eleme&MT W9_processed.xlsx'
 
     NEW_COLS = [
         '识别LOB',             # iPhone / Watch / AirPods / Accy. / iPad / Mac

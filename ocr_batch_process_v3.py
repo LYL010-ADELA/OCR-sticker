@@ -98,9 +98,6 @@ LOB_CONFIGS: dict[str, dict] = {
             {"y_min": 0.55, "y_max": 1.00},
         ],
         "front_face_aspect_range": (2.5, 5.0),
-        # Watch 盒子细长，贴纸字体偏小；短边低于阈值时主动放大再做 OCR
-        "ocr_max_side": 3000,
-        "ocr_min_short_side": 1200,
         "unofficial_color": {
             "enabled": True, "mode": "white_box",
             "sat_above_bg": 55, "val_range": (40, 230),
@@ -155,8 +152,11 @@ LOB_CONFIGS: dict[str, dict] = {
             {"x_min": 0.50, "x_max": 0.95, "y_min": 0.00, "y_max": 0.30},
         ],
         "front_face_aspect_range": (1.2, 2.0),
+        # 非官方贴纸颜色检测对 Mac 关闭：Mac 多为棕色纸箱，箱上常贴大块白色物流标/
+        # 授权店封签，会被 brown_box 检测大面积误判为"疑似非官方贴纸"（误报率高）。
+        # 关闭后 Mac 不做颜色检测，颜色检测已执行=0、是否存在非官方贴纸=0，其余流程不变。
         "unofficial_color": {
-            "enabled": True, "mode": "brown_box",
+            "enabled": False, "mode": "brown_box",
             "brown_hue_range": (5, 30), "brown_sat_min": 30,
             "brown_val_range": (40, 200), "white_sat_max": 30,
             "white_val_min": 200, "sat_min_abs": 80,
@@ -201,7 +201,10 @@ ocr = PaddleOCR(
     lang='ch',
     device='gpu',
     enable_mkldnn=False,
-    text_det_limit_side_len=3000,   # 提升至 3000 以支持 Watch 高分辨率模式
+    text_det_limit_side_len=2000,   # 注意：默认 limit_type='min'，此值是“短边放大目标”。
+                                    # 曾误改为 3000，导致所有 LOB 图片短边被放大到 3000，
+                                    # 超出检测模型训练尺度 → '扫码即领' 锚点漏检 → 背面图找不到
+                                    # → 封口贴存在大量误判为 0。实测 2000 全面优于 3000，故回退。
 )
 print("PaddleOCR 初始化完成！\n")
 
@@ -216,30 +219,13 @@ def pil_to_cv(image_pil: Image.Image) -> np.ndarray:
     return cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
 
 
-def resize_for_ocr(image: Image.Image, max_side: int = 2000,
-                   min_short_side: int = 0) -> Image.Image:
-    """
-    缩放图片以送入 OCR。
-    - 若 min_short_side > 0 且短边不足，先用 LANCZOS 放大（保留细节），
-      再按 max_side 上限裁剪；适用于 Watch 等贴纸字体偏小的场景。
-    - 常规路径：仅缩小，不放大。
-    """
+def resize_for_ocr(image: Image.Image, max_side: int = 2000) -> Image.Image:
     if image is None:
         return None
     w, h = image.size
-    short, long_ = min(w, h), max(w, h)
-
-    if min_short_side > 0 and short < min_short_side:
-        scale = min_short_side / short
-        w2, h2 = max(1, int(w * scale)), max(1, int(h * scale))
-        if max(w2, h2) > max_side:
-            scale2 = max_side / max(w2, h2)
-            w2, h2 = max(1, int(w2 * scale2)), max(1, int(h2 * scale2))
-        return image.resize((w2, h2), resample=Image.LANCZOS)
-
-    if long_ <= max_side:
+    if max(w, h) <= max_side:
         return image
-    scale = max_side / long_
+    scale = max_side / max(w, h)
     return image.resize(
         (max(1, int(w * scale)), max(1, int(h * scale))),
         resample=Image.BICUBIC
@@ -281,14 +267,12 @@ def submit_row_downloads(row) -> list[tuple]:
 # 三、OCR
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def ocr_image_full(image: Image.Image, image_id: str = "unknown",
-                   max_side: int = 2000, min_short_side: int = 0):
+def ocr_image_full(image: Image.Image, image_id: str = "unknown"):
     if image is None:
         return "", [], [], 0, 0
     try:
         orig_w, orig_h = image.size
-        image_resized = resize_for_ocr(image, max_side=max_side,
-                                       min_short_side=min_short_side)
+        image_resized = resize_for_ocr(image, max_side=2000)
         res_w, res_h = image_resized.size
 
         result = ocr.predict(input=pil_to_cv(image_resized))
@@ -813,10 +797,20 @@ def detect_unofficial_sticker_color(warped_img, color_cfg) -> tuple[bool, str]:
 # 六、贴纸定位与位置验证
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# 扫码贴锚点：原为精确匹配"扫码即领"，但 OCR 常把"领"认错（锁/顿）或把四字切断，
+# 导致整条漏检 → 找不到背面图 → 封口贴误判为 0（Mac 因贴纸小尤为频繁）。
+# 放宽为前缀"扫码即"3 字：足够唯一（不会误匹配"扫码支付"等），覆盖末字认错的情况。
+SCAN_ANCHOR = "扫码即"
+
+
+def is_scan_text(text: str) -> bool:
+    return SCAN_ANCHOR in text
+
+
 def find_all_scan_stickers(texts: list[str], polys: list) -> list[dict]:
     stickers = []
     for i, text in enumerate(texts):
-        if "扫码即领" in text and i < len(polys):
+        if is_scan_text(text) and i < len(polys):
             try:
                 poly = np.array(polys[i], dtype=float)
                 x1, y1 = float(poly[:, 0].min()), float(poly[:, 1].min())
@@ -1159,13 +1153,11 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
         _print_summary(r)
         return r
 
-    lob_cfg         = LOB_CONFIGS[lob]
-    scan_cfg        = lob_cfg["scan_sticker"]
-    auth_cfg        = lob_cfg.get("auth_sticker")
-    color_cfg       = lob_cfg.get("unofficial_color", {"enabled": False})
-    sc_mode         = lob_cfg.get("sticker_count", "single_or_dual")
-    ocr_max_side    = int(lob_cfg.get("ocr_max_side", 2000))
-    ocr_min_short   = int(lob_cfg.get("ocr_min_short_side", 0))
+    lob_cfg   = LOB_CONFIGS[lob]
+    scan_cfg  = lob_cfg["scan_sticker"]
+    auth_cfg  = lob_cfg.get("auth_sticker")
+    color_cfg = lob_cfg.get("unofficial_color", {"enabled": False})
+    sc_mode   = lob_cfg.get("sticker_count", "single_or_dual")
 
     print(f"  LOB: {lob}  (sticker_count={sc_mode})")
 
@@ -1193,13 +1185,10 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
             print(f"  水印时间: {wm_time or '(未识别)'}")
             print(f"  水印地点: {wm_loc or '(未识别)'}")
 
-        full_text, texts, polys_orig, orig_h, orig_w = ocr_image_full(
-            image, image_id,
-            max_side=ocr_max_side, min_short_side=ocr_min_short,
-        )
+        full_text, texts, polys_orig, orig_h, orig_w = ocr_image_full(image, image_id)
         print(f"  识别文字: {full_text[:120]}{'...' if len(full_text) > 120 else ''}")
 
-        if any("扫码即领" in t for t in texts):
+        if any(is_scan_text(t) for t in texts):
             back = {
                 "image": image, "texts": texts, "polys_orig": polys_orig,
                 "orig_h": orig_h, "orig_w": orig_w,
@@ -1227,7 +1216,7 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
     scan_polys_for_rect = [
         back["polys_orig"][i]
         for i, t in enumerate(back["texts"])
-        if "扫码即领" in t and i < len(back["polys_orig"])
+        if is_scan_text(t) and i < len(back["polys_orig"])
     ]
     rectify      = rectify_package_box(back["image"], lob=lob, scan_polys_orig=scan_polys_for_rect)
     rect_method  = rectify["method"]
@@ -1435,10 +1424,10 @@ def _print_summary(r: dict):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    input_file   = '/home/ubuntu/OCR/MP&eleme&MT W9.xlsx'
-    output_csv   = '/home/ubuntu/OCR/MP&eleme&MT W9_results.csv'
-    output_json  = '/home/ubuntu/OCR/MP&eleme&MT W9_results.jsonl'
-    output_excel = '/home/ubuntu/OCR/MP&eleme&MT W9_processed.xlsx'
+    input_file   = '/home/ubuntu/OCR/MP&Eleme&MT&TM W10.xlsx'
+    output_csv   = '/home/ubuntu/OCR/MP&eleme&MT&TM W10_results.csv'
+    output_json  = '/home/ubuntu/OCR/MP&eleme&MT&TM W10_results.jsonl'
+    output_excel = '/home/ubuntu/OCR/MP&eleme&MT&TM W10_processed.xlsx'
 
     NEW_COLS = [
         '识别LOB',             # iPhone / Watch / AirPods / Accy. / iPad / Mac

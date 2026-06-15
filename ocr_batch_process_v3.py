@@ -46,6 +46,12 @@ from concurrent.futures import ThreadPoolExecutor
 IMAGE_COLUMNS    = ['图片地址', 'Unnamed: 16', 'Unnamed: 17', 'Unnamed: 18', 'Unnamed: 19', 'Unnamed: 20', 'Unnamed: 21', 'Unnamed: 22']
 DOWNLOAD_WORKERS = 12
 
+# 必须按“文本”读写的列：订单号是 19 位整数，超过 float64/Excel 双精度可精确表示的
+# 上限(2^53≈16 位)。若按数字写入 .xlsx，Excel 会把它存成 double → 末几位被抹平
+# (如 5119350049330019519 → 5119350049330019328)。全程当字符串处理即可保精度。
+ID_TEXT_COLS = ['订单号']
+_ID_DTYPE    = {c: str for c in ID_TEXT_COLS}
+
 # 位置容差（相对坐标系）：封口贴绕折超出包装盒边界仍算合规
 # V3 放宽：0.15 → 0.25
 STICKER_POSITION_TOLERANCE = 0.25
@@ -1067,7 +1073,13 @@ def extract_watermark_crop(image: Image.Image, image_id: str) -> tuple[str, str]
     try:
         w, h = image.size
         crop = image.crop((0, int(h * 0.82), int(w * 0.60), h))
-        result = ocr.predict(input=pil_to_cv(crop))
+        # 水印字大且清晰，无需 2000px。检测器默认 limit_type='min' 会把这条
+        # 2177×872 的小图短边上采样到 2000（≈5000×2000，等于又跑一次全图 OCR）。
+        # 改用 limit_type='max' + 1280：只缩不放，水印仍能识别，单张 ~3.2s → ~0.45s。
+        result = ocr.predict(
+            input=pil_to_cv(crop),
+            text_det_limit_side_len=1280, text_det_limit_type='max',
+        )
         texts = []
         if result and len(result) > 0:
             r = result[0]
@@ -1424,10 +1436,10 @@ def _print_summary(r: dict):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    input_file   = '/home/ubuntu/OCR/MP&Eleme&MT&TM W10.xlsx'
-    output_csv   = '/home/ubuntu/OCR/MP&eleme&MT&TM W10_results.csv'
-    output_json  = '/home/ubuntu/OCR/MP&eleme&MT&TM W10_results.jsonl'
-    output_excel = '/home/ubuntu/OCR/MP&eleme&MT&TM W10_processed.xlsx'
+    input_file   = '/home/ubuntu/OCR/MT&MP&eleme&TM W11.xlsx'
+    output_csv   = '/home/ubuntu/OCR/MT&MP&eleme&TM W11_results.csv'
+    output_json  = '/home/ubuntu/OCR/MT&MP&eleme&TM W11_results.jsonl'
+    output_excel = '/home/ubuntu/OCR/MT&MP&eleme&TM W11_processed.xlsx'
 
     NEW_COLS = [
         '识别LOB',             # iPhone / Watch / AirPods / Accy. / iPad / Mac
@@ -1450,13 +1462,13 @@ def main():
     ]
 
     print(f"正在读取Excel: {input_file}")
-    df = pd.read_excel(input_file)
+    df = pd.read_excel(input_file, dtype=_ID_DTYPE)
     print(f"总共 {len(df)} 行数据")
 
     # 断点续传
     if os.path.exists(output_csv):
         print(f"\n发现已有结果文件: {output_csv}")
-        df_existing = pd.read_csv(output_csv, encoding='utf-8-sig')
+        df_existing = pd.read_csv(output_csv, encoding='utf-8-sig', dtype=_ID_DTYPE)
         processed_orders = set(df_existing['订单号'].astype(str))
         print(f"已处理 {len(processed_orders)} 行，继续处理剩余行...")
     else:
@@ -1536,7 +1548,7 @@ def main():
 
     # 生成最终 Excel
     print(f"\n正在生成 Excel: {output_excel}")
-    df_final = pd.read_csv(output_csv, encoding='utf-8-sig')
+    df_final = pd.read_csv(output_csv, encoding='utf-8-sig', dtype=_ID_DTYPE)
     with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
         df_final.to_excel(writer, index=False, sheet_name='结果')
     print(f"✓ 完成！共处理 {len(df_final)} 行，输出: {output_excel}")

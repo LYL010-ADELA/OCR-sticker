@@ -1436,10 +1436,10 @@ def _print_summary(r: dict):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    input_file   = '/home/ubuntu/OCR/MT&MP&eleme&TM W11.xlsx'
-    output_csv   = '/home/ubuntu/OCR/MT&MP&eleme&TM W11_results.csv'
-    output_json  = '/home/ubuntu/OCR/MT&MP&eleme&TM W11_results.jsonl'
-    output_excel = '/home/ubuntu/OCR/MT&MP&eleme&TM W11_processed.xlsx'
+    input_file   = '/home/ubuntu/OCR/W12.xlsx'
+    output_csv   = '/home/ubuntu/OCR/MT&MP&eleme&TM W12_results.csv'
+    output_json  = '/home/ubuntu/OCR/MT&MP&eleme&TM W12_results.jsonl'
+    output_excel = '/home/ubuntu/OCR/MT&MP&eleme&TM W12_processed.xlsx'
 
     NEW_COLS = [
         '识别LOB',             # iPhone / Watch / AirPods / Accy. / iPad / Mac
@@ -1463,6 +1463,13 @@ def main():
 
     print(f"正在读取Excel: {input_file}")
     df = pd.read_excel(input_file, dtype=_ID_DTYPE)
+    raw_rows = len(df)
+    # 剔除“幽灵行”：源文件常因某列(如 HQ Name)被一路填充到末尾，把 Excel 已使用
+    # 区域撑大，pandas 会把这些只有个别列、订单号为空的空行也读进来。仅保留订单号
+    # 非空的真实数据行。
+    df = df[df['订单号'].notna() & (df['订单号'].astype(str).str.strip() != '')].reset_index(drop=True)
+    if len(df) != raw_rows:
+        print(f"已剔除 {raw_rows - len(df)} 行空行(订单号为空)")
     print(f"总共 {len(df)} 行数据")
 
     # 断点续传

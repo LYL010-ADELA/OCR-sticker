@@ -2,20 +2,33 @@
 
 ## 一、LOB 总览
 
-系统需要支持以下 6 类产品线（LOB），每类的封口贴数量和规范位置不同：
+系统支持两类产品线（LOB）：**5 个核心品类**（有独立的严格位置规范）+ **配件**
+（Accy. / Beats / 原厂配件 / 甄选三方配件 3PP 等，位置规则不固定，走宽松判定）。
+详见 [ocr_batch_process_v7.py](ocr_batch_process_v7.py) 及 §九 V7 变更说明。
 
+### 核心品类（严格位置校验，逻辑不变）
 
 | LOB     | 贴纸数量  | 一贴（扫码即领）              | 二贴（Apple授权专营店）        | 包装盒特征    | 颜色检测模式 |
 | ------- | ----- | --------------------- | ---------------------- | -------- | ----------- |
 | iPhone  | 1 或 2 | 右上角                   | 右下角                    | 白色方盒，竖向  | `white_box` |
 | Watch   | 1 或 2 | 沿盒子中轴线 **顶端 或 底端**（对称） | 沿盒子中轴线 **顶端 或 底端**（对称） | 白色窄长盒，竖向 | `white_box` |
 | AirPods | 1     | 右上角                   | 无                      | 白色小方盒    | `white_box` |
-| Accy.   | 1     | 右上角                   | 无                      | 白色小方盒    | `white_box` |
 | iPad    | 1 或 2 | 右上角                   | 右下角                    | 白色大扁盒，横向 | `white_box` |
 | Mac     | 1 或 2 | 底部居中                  | 上方靠左侧                  | 棕色瓦楞纸箱   | `brown_box` |
 
-> LOB 枚举严格对齐 Excel `LOB` 列的原始字符串：`iPhone / Watch / AirPods / Accy. / iPad / Mac`，
-> 代码中的 `LOB_CONFIGS` key 与 README 小节标题必须与此一致。
+> 核心品类枚举严格对齐 Excel `LOB` 列的原始字符串：`iPhone / Watch / AirPods / iPad / Mac`
+> （代码中 `STRICT_LOBS`），`LOB_CONFIGS` key 与 README 小节标题须与此一致。
+
+### 配件（宽松判定，V7 新增）
+
+包装形状、尺寸、拍摄角度差异极大（充电器/线缆/转换器/EarPods/Pencil/HomePod/
+AirTag/妙控键鼠/Beats/保护壳/钢化膜/移动电源 等，涵盖 `在你身边 VIP 封口贴 执行
+说明和张贴规范说明` 里列出的所有非核心品类），严格位置规范不适用。
+
+**规则**：Excel `LOB` 列取值非空、且不在 `STRICT_LOBS` 中的行，一律归为配件——
+不需要逐一在代码里枚举配件名称，新增配件品类无需改代码。判定标准简化为
+"只要在任一出库图中检出'扫码即'锚点，就认为封口贴存在且规范粘贴"，不做
+位置校验、双贴校验、非官方贴纸颜色检测。详见 §九。
 
 
 贴纸样式说明：
@@ -147,7 +160,11 @@ AirPods 盒子较小，仅需一张封口贴。贴纸位置在背面右上角。
 
 ---
 
-### 2.4 原厂配件（Accy.）
+### 2.4 原厂配件（Accy.）— 已废弃，V7 起改走配件宽松判定
+
+> ⚠️ 以下位置规范自 V7 起不再生效。原厂配件种类和包装形状远比"20W USB-C 充电器"
+> 复杂多样（见 §一"配件"分类、§九 V7 变更说明），严格位置规则误判率过高，已改为
+> 宽松判定："扫码即" 锚点存在即视为封口贴存在且合规。本节保留仅供历史参考。
 
 原厂配件盒子较小（如 20W USB-C 充电器），与 AirPods 相同，仅需一张封口贴在右上角。
 
@@ -784,21 +801,38 @@ Phase 1 已经拿到的 `best.texts/polys_orig` 里筛出"扫码即领"对应的
 
 ---
 
-## 六、LOB 识别方式（严格模式）
+## 六、LOB 识别方式（V7 起：核心严格 + 配件宽松二分）
 
-LOB 的**唯一权威来源**是输入 Excel 的 `LOB` 列，枚举：
-`iPhone / Watch / AirPods / Accy. / iPad / Mac`（经 21818 行
-`value_counts` 确认覆盖 100%）。
+LOB 的**唯一权威来源**是输入 Excel 的 `LOB` 列。
 
-`detect_lob(row)` 只做一步严格匹配：
+V6 及更早版本：`detect_lob(row)` 严格匹配固定枚举
+`iPhone / Watch / AirPods / Accy. / iPad / Mac`，不在枚举内一律判 `UNKNOWN LOB`。
+
+**V7 起改为二分**（因为配件品类会持续新增，不能再靠固定枚举兜底）：
 
 ```python
+# detect_lob(row)：只要 LOB 非空，原样返回字符串（不再要求在固定枚举内）
 raw = row.get("LOB", None)
 if raw is None or pd.isna(raw):
     return "UNKNOWN LOB"
 key = str(raw).strip()
-return key if key in LOB_CONFIGS else "UNKNOWN LOB"
+return key if key else "UNKNOWN LOB"
+
+# resolve_lob_config(lob)：决定走严格位置校验还是配件宽松判定
+STRICT_LOBS = {"iPhone", "iPad", "Mac", "Watch", "AirPods"}
+
+def is_accessory_lob(lob):
+    return lob != "UNKNOWN LOB" and lob not in STRICT_LOBS
+
+def resolve_lob_config(lob):
+    if lob in STRICT_LOBS:
+        return LOB_CONFIGS[lob]          # 严格位置/双贴/颜色校验，逻辑不变
+    return ACCESSORY_LOB_CONFIG          # 配件：扫码即 ⟹ 合规，见 §九
 ```
+
+即：`LOB ∈ {iPhone,iPad,Mac,Watch,AirPods}` 走原严格逻辑；
+其它任何非空 `LOB`（Accy./Beats/原厂配件/3PP/任意新配件名）自动归为配件，
+无需修改代码；`LOB` 为空/缺失仍判 `UNKNOWN LOB`。
 
 ### 6.1 为什么移除关键词降级
 
@@ -932,4 +966,44 @@ return key if key in LOB_CONFIGS else "UNKNOWN LOB"
 | 5 | "正面打分挑选"：含扫码即领 (2.0) + 长宽比命中区间 (1.5) + 面积 tie-breaker (0.15) | `_score_quad` + `_pick_front_quad` | §5.7.2 |
 | 6 | `rectify_package_box(..., scan_polys_orig=...)`：把"扫码即领"原图多边形传入，让矫正阶段也能用此最强信号 | `rectify_package_box` 签名扩展 | §4 |
 | 7 | `dual_code == 2`（两个扫码即领）改判**合规** | `process_row` Phase 4 + `main()` 统计 | §7.1 / §8 |
+
+---
+
+## 十、V7 变更说明：配件宽松判定（`ocr_batch_process_v7.py`）
+
+### 背景
+
+除 iPhone / iPad / Mac / Watch / AirPods 五大核心品类外，门店还要贴大量配件——
+Beats、原厂配件（充电器/线缆/转换器/EarPods/Pencil/HomePod/AirTag/妙控键鼠等）、
+甄选三方配件 3PP（ANKER/UGREEN/TORRAS/MOPHIE… 的充电器/数据线/保护壳/钢化膜/
+移动电源等）。依据 `在你身边 VIP 封口贴 执行说明和张贴规范说明 - 20260727.pdf`，
+这些配件的包装形状、尺寸、拍摄角度千差万别，原有"封口贴必须落在盒面某相对坐标
+区域"的严格位置规则完全不适用，会把贴对了的配件大面积误判为不合规。
+
+### 规则
+
+1. **LOB 二分**：`LOB ∈ {iPhone,iPad,Mac,Watch,AirPods}`（`STRICT_LOBS`）走原
+   严格位置校验；其它任何**非空** LOB 一律视为配件，走宽松判定；LOB 为空/缺失
+   仍判 `UNKNOWN LOB` 不合格。配件名称无需在代码里逐一枚举，新增配件品类
+   （只要 Excel `LOB` 列有值）自动生效。
+2. **配件判定标准简化为纯锚点匹配**：只要在任一出库图中（含 0°/90°/180°/270°
+   旋转 OCR + 紫色封贴局部放大 OCR 兜底，与 Watch/AirPods 共用同一套增强逻辑）
+   检出"扫码即"锚点，即视为封口贴存在且规范粘贴：
+   `是否规范粘贴=1`、`封口贴存在=1`、`贴纸位置规范=1`；
+   未检出锚点则 `是否规范粘贴=0`、`封口贴存在=0`、`贴纸位置规范=-1`。
+3. **配件跳过**：位置校验、双贴校验、非官方贴纸颜色检测——避免配件包装
+   多样性带来的误报（如某些配件盒面本身印刷彩色元素会被颜色检测误伤）。
+4. 五大核心品类的位置/双贴/颜色检测逻辑与 V6 **逐字节一致**，未受影响。
+
+### 实现位置
+
+| 内容 | 实现位置 |
+|---|---|
+| 核心品类枚举 | `STRICT_LOBS` |
+| 配件宽松配置（`anchor_only=True`，跳过位置/双贴/颜色） | `ACCESSORY_LOB_CONFIG` |
+| LOB → 是否配件 | `is_accessory_lob(lob)` |
+| LOB → 具体配置（严格 or 宽松） | `resolve_lob_config(lob)` |
+| `detect_lob` 改为原样返回 LOB 字符串（不再要求在固定枚举内） | `detect_lob(row)` |
+| 配件的锚点宽松判定分支（在找到背面图之后、位置矫正之前提前返回） | `process_row` Phase A |
+| 配件启用多角度 OCR + 紫色封贴局部 OCR（原仅 Watch/AirPods） | `scan_ocr_angles_for_lob` / `find_back_image_by_scan_anchor` |
 

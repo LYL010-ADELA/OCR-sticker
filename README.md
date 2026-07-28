@@ -1007,3 +1007,42 @@ Beats、原厂配件（充电器/线缆/转换器/EarPods/Pencil/HomePod/AirTag/
 | 配件的锚点宽松判定分支（在找到背面图之后、位置矫正之前提前返回） | `process_row` Phase A |
 | 配件启用多角度 OCR + 紫色封贴局部 OCR（原仅 Watch/AirPods） | `scan_ocr_angles_for_lob` / `find_back_image_by_scan_anchor` |
 
+---
+
+## 十一、V7 补充：下载稳健性改进（解决"下载跟不上识别，需手动重跑一次"）
+
+**现象**：服务器下载图片的并发量（`--workers × --download-workers`，默认
+12×6=72）超过图片服务器/CDN 承受能力时，部分请求超时/被限流，耗尽重试后判定
+为下载失败 → 找不到背面图 → 误判不合规；把这批失败行单独重跑一次时并发骤降，
+反而成功。**注意**：架构上 OCR 本就严格等该图片的下载 future 完成（成功或耗尽
+重试）才会执行，不存在"边下边识别"的竞态，真正瓶颈是下载本身在高并发下的失败率。
+
+**改动**：
+
+1. **全局下载并发上限**（`--download-concurrency`，默认 32）：新增跨所有
+   worker 进程共享的 `multiprocessing.BoundedSemaphore`，把实际同时发起的
+   下载请求数摁在固定上限内，不再随 `--workers × --download-workers` 乘积
+   失控增长；只包住实际的 `requests.get()` 调用，不影响退避等待和 OCR 的
+   GPU 并发。
+2. **下载完整性校验**：校验响应 `Content-Length` 与实际收到字节数，不一致
+   （部分 CDN 会返回 200 但内容被截断而不报错）时视为失败并重试，而不是把
+   截断的图片喂给 OCR。
+3. **自动补下载重试轮**（`--extra-retry-passes`，默认 1，设 0 关闭）：主
+   批次跑完后，自动收集"封口贴存在≠1"（含下载失败、未写入结果）的订单号，
+   在并发已大幅降低的情况下自动再跑一轮，把"手动重跑第二次"内建进单次运行；
+   仍未成功可继续下一轮，直至用完设定轮数或不再有新的失败行。
+   > 该重试轮不区分"真下载失败"与"确实没贴封口贴"，两者都会被重试一次
+   > ——用一轮有限的额外计算换取召回率，是有意为之的取舍。
+
+**实现位置**：
+
+| 内容 | 实现位置 |
+|---|---|
+| 全局下载并发闸的创建与传递 | `main()` 创建 `ctx.BoundedSemaphore`；经 `worker_main` → `init_worker_ocr` 存入进程全局 `_download_semaphore` |
+| 下载请求的并发限流 + Content-Length 校验 | `download_image()` |
+| 补下载重试轮的分片文件隔离（避免与主批次断点续传互相干扰） | `_shard_paths(output_csv, worker_id, round_id)` |
+| 分片发现改为 glob + (round, worker) 排序（而非固定 `range(num_workers_scan)`） | `_iter_shard_csvs()` |
+| 判断某订单是否仍需重试 | `_orders_missing_seal()` |
+| 单轮 worker 生命周期（生成/等待/汇报）抽取为可复用函数，主批次与各重试轮共用 | `_run_worker_round()` |
+| 主流程编排：主批次 → 循环补下载重试 → 合并 | `main()` |
+

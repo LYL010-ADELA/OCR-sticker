@@ -22,7 +22,28 @@ V7 相对 V6 的核心改动：配件（Accessory）走"扫码即"宽松判定
        避免配件包装多样性带来的误报。
 
   五大核心品类的检测逻辑（位置/双贴/颜色）与 V6 逐字节一致。
-═══════════════════════════════════════════════════════════════════════════════
+
+V7 补充：下载稳健性改进（解决"下载速度跟不上识别速度，第二次重跑才能识别上"）
+  现象：服务器下载图片的并发量（--workers × --download-workers，默认 12×6=72）
+  超过图片服务器/CDN 承受能力时，部分请求超时/被限流，耗尽重试后被判定为下载
+  失败 → 找不到背面图 → 误判不合规；重新单独跑这批失败行时并发骤降，反而成功。
+  注意：架构上 OCR 本就严格等该图片的下载 future 完成（成功或耗尽重试）才会执行，
+  不存在"边下边识别"的竞态；真正瓶颈是下载本身在高并发下的失败率。
+
+  1. 全局下载并发上限（`--download-concurrency`，默认 32）：新增跨所有 worker
+     进程共享的 `multiprocessing.BoundedSemaphore`，把实际同时发起的下载请求数
+     卡在一个固定上限内，不再随 --workers/--download-workers 乘积失控增长。
+     只包住实际网络请求（`requests.get`），不影响退避等待和 OCR 的 GPU 并发。
+  2. 下载完整性校验：校验响应 `Content-Length` 与实际收到字节数，不一致（部分
+     CDN 会返回 200 但内容被截断而不报错）时视为失败并重试，而不是把截断的
+     图片喂给 OCR。
+  3. 自动补下载重试轮（`--extra-retry-passes`，默认 1，设 0 关闭）：主批次跑完
+     后，自动收集"封口贴存在≠1"（含下载失败/未写入结果）的订单号，在并发已
+     大幅降低的情况下自动再跑一轮，等价于把你现在手动重跑第二次的动作内建进
+     单次运行；仍未成功可继续下一轮，直至用完设定轮数或不再有新的失败行。
+     注：该重试轮不区分"真下载失败"与"确实没贴封口贴"，两者都会被重试一次，
+     属于有意为之的取舍（换取召回率），多数情况下额外耗时有限。
+
 以下为 V5 说明（Watch/AirPods 锚点增强，V6/V7 未改动核心检测）：
 
 V5 相对 V4 的核心改动：
@@ -119,6 +140,14 @@ DOWNLOAD_WORKERS = 6
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_TIMEOUT = 20
 DOWNLOAD_RETRY_BACKOFF = 1.0
+
+# V7：全局下载并发上限（跨所有 worker 进程共享的 BoundedSemaphore）。
+# --workers × --download-workers 的乘积（默认 12×6=72）容易超过图片服务器/CDN
+# 承受能力，导致高失败率；这里再加一层跨进程总闸，与 workers 数量解耦。
+DEFAULT_GLOBAL_DOWNLOAD_CONCURRENCY = 32
+
+# V7：主批次跑完后，自动对"封口贴存在≠1"的行做的补下载重试轮数（0=关闭）。
+DEFAULT_EXTRA_RETRY_PASSES = 1
 
 # 整图 OCR 输入尺寸。PaddleOCR 默认 text_det_limit_type='min' 会把短边放大到
 # side_len，竖长图/横长图会被内部放成 5000~7000px 后再缩回 max_side_limit=4000，
@@ -325,17 +354,23 @@ def detect_lob(row) -> str:
 # 一致，无需改动任何检测代码。
 ocr = None
 _dl_executor = None
+# V7：跨 worker 进程共享的下载并发闸（multiprocessing.BoundedSemaphore），由主进程
+# 创建后传给每个 worker，在 init_worker_ocr() 中存入本进程全局，供 download_image()
+# 在发起每次 HTTP 请求前 acquire/release，实现"全局并发上限"而非"每进程各自上限"。
+_download_semaphore = None
 
 
 def init_worker_ocr(gpu_mem_fraction: float | None = None,
-                    download_workers: int = DOWNLOAD_WORKERS):
+                    download_workers: int = DOWNLOAD_WORKERS,
+                    download_semaphore=None):
     """在 worker 进程内初始化 PaddleOCR + 下载线程池。
 
     必须在导入 paddle 之前设置 FLAGS 环境变量，因此 paddleocr 的 import 放在这里。
     多进程共用一块 GPU 时用 auto_growth 分配策略：每个进程只按需申请显存，
     避免某个进程一次性抢占过大比例导致其他进程 OOM。
     """
-    global ocr, _dl_executor
+    global ocr, _dl_executor, _download_semaphore
+    _download_semaphore = download_semaphore
 
     # auto_growth：多进程共享单卡的关键。每进程按需增长显存，而非预占固定比例。
     os.environ.setdefault("FLAGS_allocator_strategy", "auto_growth")
@@ -387,9 +422,18 @@ def download_image(url: str,
                    backoff: float = DOWNLOAD_RETRY_BACKOFF) -> dict:
     """下载并解码单张图片。
 
-    返回结构中保留 status/attempts，避免下载失败被误当成“没有封口贴”。
+    返回结构中保留 status/attempts，避免下载失败被误当成"没有封口贴"。
     调用方仍按 submit_row_downloads 绑定的 (col_idx, col, url, future) 顺序取回，
     不依赖并发完成顺序，因此不会发生图片列错配。
+
+    V7：
+      1. 若设置了全局下载并发闸 `_download_semaphore`（跨所有 worker 进程共享），
+         只包住实际的 `requests.get()` 网络请求，把同时在飞的下载请求数摁在
+         --download-concurrency 设定的上限内，避免 --workers × --download-workers
+         的乘积压垮图片服务器/CDN。退避等待和 PIL 解码不占用并发名额。
+      2. 校验响应 Content-Length 与实际收到字节数：部分 CDN 在异常情况下会返回
+         200 但内容被截断而不报错，直接喂给 PIL 有时仍能"看似"解码成功但内容不
+         完整。这里提前识别为失败并重试，而不是让残缺图片进入 OCR。
     """
     if pd.isna(url) or url == '':
         return {"ok": False, "image": None, "status": "empty_url", "attempts": 0}
@@ -398,10 +442,28 @@ def download_image(url: str,
     max_attempts = max(1, int(retries) + 1)
     for attempt in range(1, max_attempts + 1):
         try:
-            response = requests.get(url, timeout=timeout)
+            if _download_semaphore is not None:
+                _download_semaphore.acquire()
+            try:
+                response = requests.get(url, timeout=timeout)
+            finally:
+                if _download_semaphore is not None:
+                    _download_semaphore.release()
+
             status_code = response.status_code
             if status_code == 200:
-                image = Image.open(BytesIO(response.content))
+                content = response.content
+                expected_len_hdr = response.headers.get('Content-Length')
+                if expected_len_hdr is not None:
+                    try:
+                        expected_len = int(expected_len_hdr)
+                        if expected_len > 0 and len(content) < expected_len:
+                            raise IOError(
+                                f"下载不完整：收到 {len(content)}/{expected_len} 字节"
+                            )
+                    except ValueError:
+                        pass  # Content-Length 非法值，跳过校验，走后续 PIL 解码兜底
+                image = Image.open(BytesIO(content))
                 image.load()
                 return {
                     "ok": True,
@@ -1992,52 +2054,132 @@ def _result_to_row(row, r: dict) -> dict:
     return result_row
 
 
-def _shard_paths(output_csv: str, worker_id: int) -> tuple[str, str, str]:
-    """由最终 CSV 路径推导某个 worker 的分片 csv / jsonl / log 路径。"""
-    stem, _ = os.path.splitext(output_csv)
-    return (f"{stem}.wshard{worker_id}.csv",
-            f"{stem}.wshard{worker_id}.jsonl",
-            f"{stem}.wshard{worker_id}.log")
+def _shard_paths(output_csv: str, worker_id: int, round_id: int = 0) -> tuple[str, str, str]:
+    """由最终 CSV 路径推导某个 worker 的分片 csv / jsonl / log 路径。
 
-
-def _read_processed_orders(output_csv: str, num_workers_scan: int = 64) -> set[str]:
-    """收集所有已处理的订单号，用于断点续传。
-
-    会扫描两类文件，取并集：
-      1) 合并 CSV(output_csv) 本身 —— 兼容 V3！V3 是单文件追加输出，所以一份
-         跑到一半的 V3 结果 CSV 会被 V4 直接识别为“已处理”，无缝续跑。也兼容
-         上一次 V4 合并生成的最终 CSV。
-      2) 各 worker 分片 CSV {stem}.wshard{K}.csv —— V4 崩溃/中断后的续传来源。
-    扫描到比 --workers 更多的分片编号（上限 num_workers_scan），即使两次运行 worker
-    数不同也能覆盖之前所有分片。
+    V7：round_id=0（主批次）文件名与 V6 完全一致，不破坏历史分片的断点续传；
+    round_id>=1 为"自动补下载重试轮"，用独立文件名（.retryN）避免与主批次的
+    分片内断点续传（shard_done）互相干扰——否则重试轮会把主批次里已写过的
+    失败行误判为"已处理"而跳过，起不到重试作用。
     """
-    processed_state: dict[str, bool] = {}
-    candidates = [output_csv]
-    candidates += [_shard_paths(output_csv, k)[0] for k in range(num_workers_scan)]
-    for csv_path in candidates:
-        if not os.path.exists(csv_path):
-            continue
+    stem, _ = os.path.splitext(output_csv)
+    tag = f".retry{round_id}" if round_id else ""
+    return (f"{stem}.wshard{worker_id}{tag}.csv",
+            f"{stem}.wshard{worker_id}{tag}.jsonl",
+            f"{stem}.wshard{worker_id}{tag}.log")
+
+
+_SHARD_CSV_RE = re.compile(r'\.wshard(\d+)(?:\.retry(\d+))?\.csv$')
+
+
+def _iter_shard_csvs(output_csv: str) -> list[str]:
+    """发现某最终 CSV 对应的全部分片 csv（主批次 + 所有补下载重试轮），
+    按 (round_id, worker_id) 排序——round 靠后的文件排在后面，
+    使 merge 阶段 drop_duplicates(keep='last') 时更晚的重试轮结果覆盖更早的。
+    仅按文件名字符串排序做不到这点：worker 编号会干扰 round 顺序（例如
+    'wshard3.retry1.csv' 按字典序会排在 'wshard7.csv' 之前），必须显式按
+    round 优先排序。
+    """
+    stem, _ = os.path.splitext(output_csv)
+    paths = glob.glob(f"{glob.escape(stem)}.wshard*.csv")
+
+    def _sort_key(p: str):
+        m = _SHARD_CSV_RE.search(os.path.basename(p))
+        if not m:
+            return (0, 0)
+        worker_id = int(m.group(1))
+        round_id  = int(m.group(2)) if m.group(2) else 0
+        return (round_id, worker_id)
+
+    return sorted(paths, key=_sort_key)
+
+
+def _collect_shard_frames(output_csv: str) -> list[pd.DataFrame]:
+    """读取合并 CSV(若存在) + 全部分片 csv（主批次 + 各补下载重试轮），
+    按"更晚处理的结果更权威"的顺序返回，供 merge_shards / _read_processed_orders /
+    _orders_missing_seal 复用。
+
+    兼容 V3：合并 CSV(output_csv) 可能是一份跑到一半的 V3 单文件结果，或
+    上一次合并输出；不先纳入就直接覆盖会丢掉那些行。
+    """
+    frames = []
+    if os.path.exists(output_csv):
+        try:
+            frames.append(pd.read_csv(output_csv, encoding='utf-8-sig',
+                                      dtype=_ID_DTYPE, on_bad_lines='skip'))
+        except Exception as e:
+            print(f"  ⚠ 读取已有 CSV {output_csv} 失败: {e}")
+    for csv_shard in _iter_shard_csvs(output_csv):
         try:
             # on_bad_lines='skip'：容忍上次崩溃残留的半行 —— 那一行会被当作未处理重跑
-            dfx = pd.read_csv(csv_path, encoding='utf-8-sig', dtype=_ID_DTYPE,
-                              on_bad_lines='skip')
-            if '订单号' in dfx.columns:
-                for _, r in dfx.iterrows():
-                    oid = str(r.get('订单号', '')).strip()
-                    if not oid:
-                        continue
-                    download_status = str(r.get('图片下载状态', '')).strip()
-                    detail = str(r.get('位置说明', '')).strip()
-                    position_valid = str(r.get('贴纸位置规范', '')).strip()
-                    incomplete_download = (
-                        download_status == '下载不完整'
-                        or detail.startswith('图片下载不完整')
-                        or position_valid in {'-2', '-2.0'}
-                    )
-                    # 与 merge_shards 的 keep='last' 一致：后读到的同订单结果覆盖前面的状态。
-                    processed_state[oid] = not incomplete_download
+            frames.append(pd.read_csv(csv_shard, encoding='utf-8-sig',
+                                      dtype=_ID_DTYPE, on_bad_lines='skip'))
         except Exception as e:
-            print(f"  ⚠ 读取 {csv_path} 失败（忽略，相关行将重跑）: {e}")
+            print(f"  ⚠ 读取分片 {csv_shard} 失败: {e}")
+    return frames
+
+
+def _merge_frames(df: pd.DataFrame, frames: list[pd.DataFrame]) -> pd.DataFrame | None:
+    """把多份分片结果合并去重（同订单号保留最后一次结果），按源文件原始行序排序。"""
+    if not frames:
+        return None
+    merged = pd.concat(frames, ignore_index=True)
+    if '订单号' in merged.columns:
+        merged = merged.drop_duplicates(subset='订单号', keep='last')
+        order_to_pos = {str(oid): i for i, oid in enumerate(df['订单号'].astype(str))}
+        merged['__pos__'] = merged['订单号'].astype(str).map(
+            lambda o: order_to_pos.get(o, len(order_to_pos))
+        )
+        merged = merged.sort_values('__pos__', kind='stable').drop(columns='__pos__')
+    return merged
+
+
+def _orders_missing_seal(merged: pd.DataFrame | None, order_ids) -> list[str]:
+    """V7：从当前合并结果中找出仍"封口贴存在≠1"的订单号（含未写入结果的，
+    如 worker 崩溃导致该行完全没落盘），供自动补下载重试轮判断是否需要再来一轮。
+
+    不区分"真下载失败"与"确实没贴封口贴"——两者都会被重试一次，用一轮额外
+    计算换取召回率，是本功能有意为之的取舍。
+    """
+    order_ids = {str(o) for o in order_ids}
+    if merged is None or '订单号' not in merged.columns or '封口贴存在' not in merged.columns:
+        return sorted(order_ids)
+    sub = merged[merged['订单号'].astype(str).isin(order_ids)]
+    seal = pd.to_numeric(sub['封口贴存在'], errors='coerce').fillna(0)
+    missing = set(sub.loc[seal != 1, '订单号'].astype(str))
+    found_ids = set(sub['订单号'].astype(str))
+    missing |= (order_ids - found_ids)   # 完全没写入结果的订单号也要重试
+    return sorted(missing)
+
+
+def _read_processed_orders(output_csv: str) -> set[str]:
+    """收集所有已处理的订单号，用于断点续传。
+
+    会扫描合并 CSV(output_csv) + 全部分片 csv（含各补下载重试轮，见
+    _iter_shard_csvs），取并集。兼容 V3：V3 是单文件追加输出，所以一份跑到
+    一半的 V3 结果 CSV 会被直接识别为"已处理"，无缝续跑。
+    """
+    processed_state: dict[str, bool] = {}
+    for dfx in _collect_shard_frames(output_csv):
+        if '订单号' not in dfx.columns:
+            continue
+        try:
+            for _, r in dfx.iterrows():
+                oid = str(r.get('订单号', '')).strip()
+                if not oid:
+                    continue
+                download_status = str(r.get('图片下载状态', '')).strip()
+                detail = str(r.get('位置说明', '')).strip()
+                position_valid = str(r.get('贴纸位置规范', '')).strip()
+                incomplete_download = (
+                    download_status == '下载不完整'
+                    or detail.startswith('图片下载不完整')
+                    or position_valid in {'-2', '-2.0'}
+                )
+                # 与 merge_shards 的 keep='last' 一致：后读到的同订单结果覆盖前面的状态。
+                processed_state[oid] = not incomplete_download
+        except Exception as e:
+            print(f"  ⚠ 解析分片内容失败（忽略，相关行将重跑）: {e}")
     return {oid for oid, is_done in processed_state.items() if is_done}
 
 
@@ -2053,10 +2195,18 @@ def worker_main(worker_id: int,
                 download_workers: int,
                 prefetch_rows: int,
                 progress_counter,
-                progress_lock):
+                progress_lock,
+                round_id: int = 0,
+                download_semaphore=None):
     """单个 worker 进程：初始化自己的 PaddleOCR，串行处理分到的行（内部预取下载），
-    结果写入自己的分片文件。逐行详细日志重定向到分片 .log 文件，保持终端整洁。"""
-    csv_shard, json_shard, log_shard = _shard_paths(output_csv, worker_id)
+    结果写入自己的分片文件。逐行详细日志重定向到分片 .log 文件，保持终端整洁。
+
+    V7：round_id>=1 时使用独立分片文件名（.retryN，见 _shard_paths），代表
+    "自动补下载重试轮"；download_semaphore 是跨所有 worker 进程共享的全局下载
+    并发闸，透传给 init_worker_ocr() 供 download_image() 使用。
+    """
+    csv_shard, json_shard, log_shard = _shard_paths(output_csv, worker_id, round_id)
+    tag = f"[W{worker_id}]" if not round_id else f"[W{worker_id}][重试轮{round_id}]"
 
     # 详细日志 → 分片 .log（line-buffered）。终端只保留主进程的聚合进度。
     sys.stdout = open(log_shard, 'a', encoding='utf-8', buffering=1)
@@ -2066,11 +2216,11 @@ def worker_main(worker_id: int,
         print(msg, file=sys.__stderr__, flush=True)
 
     try:
-        note(f"[W{worker_id}] 初始化 PaddleOCR … ({len(df_shard)} 行待处理)")
-        init_worker_ocr(gpu_mem_fraction, download_workers)
-        note(f"[W{worker_id}] PaddleOCR 就绪，开始处理")
+        note(f"{tag} 初始化 PaddleOCR … ({len(df_shard)} 行待处理)")
+        init_worker_ocr(gpu_mem_fraction, download_workers, download_semaphore)
+        note(f"{tag} PaddleOCR 就绪，开始处理")
     except Exception as e:
-        note(f"[W{worker_id}] ✗ PaddleOCR 初始化失败: {type(e).__name__}: {e}")
+        note(f"{tag} ✗ PaddleOCR 初始化失败: {type(e).__name__}: {e}")
         traceback.print_exc()
         sys.exit(1)
 
@@ -2118,56 +2268,26 @@ def worker_main(worker_id: int,
             for col in NEW_COLS:
                 error_row[col] = f"ERROR: {str(e)[:80]}" if col == '位置说明' else None
             save_result_immediately(error_row, csv_shard, json_shard)
-            note(f"[W{worker_id}] 行{idx + 1} 订单{order_id} → ✗ 异常: {str(e)[:60]}")
+            note(f"{tag} 行{idx + 1} 订单{order_id} → ✗ 异常: {str(e)[:60]}")
 
         with progress_lock:
             progress_counter.value += 1
 
-    note(f"[W{worker_id}] ✓ 分片完成，共处理 {len(rows)} 行")
+    note(f"{tag} ✓ 分片完成，共处理 {len(rows)} 行")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 十二、合并 & 主进程
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def merge_shards(df: pd.DataFrame, output_csv: str, output_excel: str,
-                 num_workers_scan: int = 64) -> bool:
-    """合并所有分片 → 按源文件原始行序输出最终 CSV + Excel。
-
-    关键：先把已存在的合并 CSV(output_csv) 读进来再合并 —— 它可能是一份跑到一半的
-    V3 单文件结果，或上一次 V4 的合并输出。不先纳入就直接覆盖会丢掉那些行。
-    """
-    frames = []
-    if os.path.exists(output_csv):
-        try:
-            frames.append(pd.read_csv(output_csv, encoding='utf-8-sig',
-                                      dtype=_ID_DTYPE, on_bad_lines='skip'))
-        except Exception as e:
-            print(f"  ⚠ 合并时读取已有 CSV {output_csv} 失败: {e}")
-    for k in range(num_workers_scan):
-        csv_shard, _, _ = _shard_paths(output_csv, k)
-        if os.path.exists(csv_shard):
-            try:
-                frames.append(pd.read_csv(csv_shard, encoding='utf-8-sig',
-                                          dtype=_ID_DTYPE, on_bad_lines='skip'))
-            except Exception as e:
-                print(f"  ⚠ 合并时读取分片 {csv_shard} 失败: {e}")
-
+def merge_shards(df: pd.DataFrame, output_csv: str, output_excel: str) -> bool:
+    """合并所有分片（含各补下载重试轮） → 按源文件原始行序输出最终 CSV + Excel。"""
+    frames = _collect_shard_frames(output_csv)
     if not frames:
         print("  ⚠ 没有任何分片结果可合并。")
         return False
 
-    merged = pd.concat(frames, ignore_index=True)
-    # 去重：同一订单号只保留最后一次结果（正常情况下不会重复）
-    if '订单号' in merged.columns:
-        merged = merged.drop_duplicates(subset='订单号', keep='last')
-        # 按源文件原始行序排序
-        order_to_pos = {str(oid): i for i, oid in enumerate(df['订单号'].astype(str))}
-        merged['__pos__'] = merged['订单号'].astype(str).map(
-            lambda o: order_to_pos.get(o, len(order_to_pos))
-        )
-        merged = merged.sort_values('__pos__', kind='stable').drop(columns='__pos__')
-
+    merged = _merge_frames(df, frames)
     merged.to_csv(output_csv, index=False, encoding='utf-8-sig')
     print(f"✓ 合并完成，最终 CSV: {output_csv}（{len(merged)} 行）")
 
@@ -2220,6 +2340,15 @@ def parse_args():
                    help='显式限制每进程显存比例（缺省用 auto_growth 按需分配）')
     p.add_argument('--progress-interval', type=float, default=5.0,
                    help='主进程聚合进度刷新间隔（秒）')
+    p.add_argument('--download-concurrency', type=int,
+                   default=DEFAULT_GLOBAL_DOWNLOAD_CONCURRENCY,
+                   help='全局下载并发上限，跨所有 worker 进程共享（缺省 32）。'
+                        '防止 --workers × --download-workers 的乘积压垮图片服务器/CDN，'
+                        '导致高并发下大量下载超时失败')
+    p.add_argument('--extra-retry-passes', type=int,
+                   default=DEFAULT_EXTRA_RETRY_PASSES,
+                   help='主批次跑完后，自动对"封口贴存在≠1"的行做的补下载重试轮数'
+                        '（缺省 1；设为 0 关闭，等价于 V6 行为，需手动重跑整个脚本）')
     args = p.parse_args()
     args.input = args.input or args.input_file
     if not args.input:
@@ -2228,6 +2357,77 @@ def parse_args():
             '"/Users/yilinlin/Desktop/Apple/Temp_Tasks/OCR/OCR-sticker/Q4W1-出库照片.xlsx"'
         )
     return args
+
+
+def _run_worker_round(pending_df: pd.DataFrame, total_rows: int, output_csv: str,
+                      args, round_id: int, ctx, download_semaphore) -> bool:
+    """跑一轮 worker：round_id=0 为主批次，round_id>=1 为 V7 自动补下载重试轮。
+
+    返回 True 表示本轮所有 worker 正常退出（无异常）；False 表示有 worker 崩溃
+    （此时调用方应停止后续重试轮并保留分片文件，供人工排查/续传）。
+    """
+    n_pending = len(pending_df)
+    if n_pending == 0:
+        return True
+
+    round_label = "主批次" if round_id == 0 else f"补下载重试第{round_id}轮"
+    num_workers = max(1, min(args.workers, n_pending))
+
+    # 跨步(strided)分片：把连续的“难行”摊到不同 worker，负载更均衡
+    shards = [pending_df.iloc[k::num_workers] for k in range(num_workers)]
+
+    progress_counter = ctx.Value('i', 0)
+    progress_lock    = ctx.Lock()
+
+    procs = []
+    for k in range(num_workers):
+        if len(shards[k]) == 0:
+            continue
+        p = ctx.Process(
+            target=worker_main,
+            args=(k, shards[k], total_rows, output_csv,
+                  args.gpu_mem_fraction, args.download_workers, args.prefetch,
+                  progress_counter, progress_lock, round_id, download_semaphore),
+            name=f"ocr-worker-{k}" if round_id == 0 else f"ocr-retry{round_id}-worker-{k}",
+        )
+        p.start()
+        procs.append(p)
+
+    print(f"已启动 {len(procs)} 个 worker 进程（{round_label}），正在处理 {n_pending} 行 …\n")
+
+    start_time = time.time()
+    while True:
+        alive = [p for p in procs if p.is_alive()]
+        done  = progress_counter.value
+        elapsed = time.time() - start_time
+        rate    = done / elapsed if elapsed > 0 else 0
+        eta_s   = (n_pending - done) / rate if rate > 0 else 0
+        print(f"\r[{round_label}] 进度 {done}/{n_pending}  ({done / n_pending * 100:5.1f}%)  "
+              f"存活worker {len(alive)}/{len(procs)}  "
+              f"速率 {rate:4.1f} 行/秒  已用 {elapsed / 60:5.1f}min  "
+              f"预计剩余 {eta_s / 60:5.1f}min      ",
+              end='', file=sys.__stderr__, flush=True)
+        if not alive:
+            break
+        time.sleep(args.progress_interval)
+
+    print(file=sys.__stderr__)  # 换行
+    for p in procs:
+        p.join()
+
+    # 报告异常退出的 worker（分片可能未跑完 → 重跑本脚本即可续传）
+    dead = [p for p in procs if p.exitcode not in (0, None)]
+    if dead:
+        print(f"\n⚠ [{round_label}] 有 {len(dead)} 个 worker 非正常退出："
+              f"{[(p.name, p.exitcode) for p in dead]}")
+        print("  重新运行本脚本即可从分片断点续传未完成的行。")
+
+    final_done = progress_counter.value
+    total_elapsed = time.time() - start_time
+    print(f"[{round_label}] 本轮处理 {final_done} 行，用时 {total_elapsed / 60:.1f}min "
+          f"（平均 {final_done / total_elapsed if total_elapsed > 0 else 0:.1f} 行/秒）")
+
+    return not dead
 
 
 def main():
@@ -2244,6 +2444,8 @@ def main():
     print(f"输出 CSV:    {output_csv}")
     print(f"输出 Excel:  {output_excel}")
     print(f"worker 数:   {args.workers}  (CPU 核数={os.cpu_count()})")
+    print(f"下载并发上限: {args.download_concurrency}（全局，跨所有 worker 进程共享）")
+    print(f"自动补下载重试轮数: {args.extra_retry_passes}（0=关闭）")
     print(f"分片文件:    {os.path.splitext(output_csv)[0]}.wshard*.csv / .jsonl / .log")
     print("=" * 80)
 
@@ -2276,69 +2478,40 @@ def main():
             cleanup_shards(output_csv)
         return
 
-    num_workers = max(1, min(args.workers, n_pending))
-
-    # 跨步(strided)分片：把连续的“难行”摊到不同 worker，负载更均衡
-    shards = [pending_df.iloc[k::num_workers] for k in range(num_workers)]
-
     ctx = mp.get_context('spawn')          # CUDA 必须用 spawn，不能 fork
-    progress_counter = ctx.Value('i', 0)
-    progress_lock    = ctx.Lock()
+    # V7：全局下载并发闸，跨所有 worker 进程共享，防止 --workers × --download-workers
+    # 的乘积压垮图片服务器/CDN（见文件顶部 V7 补充说明）。
+    download_semaphore = ctx.BoundedSemaphore(max(1, args.download_concurrency))
 
-    procs = []
-    for k in range(num_workers):
-        if len(shards[k]) == 0:
-            continue
-        p = ctx.Process(
-            target=worker_main,
-            args=(k, shards[k], total_rows, output_csv,
-                  args.gpu_mem_fraction, args.download_workers, args.prefetch,
-                  progress_counter, progress_lock),
-            name=f"ocr-worker-{k}",
-        )
-        p.start()
-        procs.append(p)
+    all_ok = _run_worker_round(pending_df, total_rows, output_csv, args,
+                               round_id=0, ctx=ctx, download_semaphore=download_semaphore)
 
-    print(f"已启动 {len(procs)} 个 worker 进程，正在处理 {n_pending} 行 …\n")
-
-    start_time = time.time()
-    while True:
-        alive = [p for p in procs if p.is_alive()]
-        done  = progress_counter.value
-        elapsed = time.time() - start_time
-        rate    = done / elapsed if elapsed > 0 else 0
-        eta_s   = (n_pending - done) / rate if rate > 0 else 0
-        print(f"\r进度 {done}/{n_pending}  ({done / n_pending * 100:5.1f}%)  "
-              f"存活worker {len(alive)}/{len(procs)}  "
-              f"速率 {rate:4.1f} 行/秒  已用 {elapsed / 60:5.1f}min  "
-              f"预计剩余 {eta_s / 60:5.1f}min      ",
-              end='', file=sys.__stderr__, flush=True)
-        if not alive:
+    # V7：自动补下载重试轮 —— 把"手动重跑一次"内建进单次运行。主批次高并发下载
+    # 拥堵导致的瞬时失败，会在这里以低得多的并发（剩余行数远少于主批次）自动重试，
+    # 无需人工干预。仅在上一轮 worker 全部正常退出时才继续，异常退出说明基础设施
+    # 有问题，不应盲目重试。
+    current_ids = set(pending_df['订单号'].astype(str))
+    round_id = 0
+    while all_ok and round_id < args.extra_retry_passes and current_ids:
+        merged = _merge_frames(df, _collect_shard_frames(output_csv))
+        retry_ids = _orders_missing_seal(merged, current_ids)
+        if not retry_ids:
             break
-        time.sleep(args.progress_interval)
+        round_id += 1
+        print(f"\n发现 {len(retry_ids)} 行未识别到封口贴/背面图（疑似下载问题），"
+              f"启动第 {round_id} 轮自动补下载重试…")
+        retry_df = df[df['订单号'].astype(str).isin(retry_ids)]
+        all_ok = _run_worker_round(retry_df, total_rows, output_csv, args,
+                                   round_id=round_id, ctx=ctx,
+                                   download_semaphore=download_semaphore)
+        current_ids = set(retry_ids)
 
-    print(file=sys.__stderr__)  # 换行
-    for p in procs:
-        p.join()
-
-    # 报告异常退出的 worker（分片可能未跑完 → 重跑本脚本即可续传）
-    dead = [p for p in procs if p.exitcode not in (0, None)]
-    if dead:
-        print(f"\n⚠ 有 {len(dead)} 个 worker 非正常退出："
-              f"{[(p.name, p.exitcode) for p in dead]}")
-        print("  重新运行本脚本即可从分片断点续传未完成的行。")
-
-    final_done = progress_counter.value
-    total_elapsed = time.time() - start_time
-    print(f"\n本次处理 {final_done} 行，用时 {total_elapsed / 60:.1f}min "
-          f"（平均 {final_done / total_elapsed if total_elapsed > 0 else 0:.1f} 行/秒）")
-
-    # 合并分片 → 最终输出
+    # 合并所有轮次的分片 → 最终输出
     print("\n正在合并所有 worker 分片 …")
     merge_ok = merge_shards(df, output_csv, output_excel)
-    if merge_ok and not dead:
+    if merge_ok and all_ok:
         cleanup_shards(output_csv)
-    elif dead:
+    elif not all_ok:
         print("  保留 worker 分片文件，便于下次断点续传。")
 
 

@@ -68,6 +68,14 @@ V7.2 加固（同日）：瞬时 OOM 当场消化（V7.1 重跑首 5min 实测�
   2. OOM 处理从"清缓存立即重试 1 次"改为"清缓存 + 退避 0.5/1/2s，最多 3 次"：
      瞬时峰值几秒内自然消散，绝大多数行当场恢复，不再攒到结尾的自动重试轮。
 
+V7.3 根治（同日）：每进程显存硬上限（--gpu-mem-limit-mb，默认 3300）
+  V7.2 实测：8 worker 下仍有 ~2% 行 OOM，且退避 3 次仍失败、连紫贴小图都会
+  OOM——说明显存被邻居进程的 auto_growth 缓存囤走（有单进程囤到 6.3GB），
+  empty_cache 只能清本进程的缓存，救不了跨进程囤积。
+  FLAGS_gpu_memory_limit_mb 让每个进程到达自己额度时必须回收自己的空闲缓存，
+  而不是伸手抢占全卡剩余，从机制上杜绝跨进程挤兑；配合缓存释放频率 10→5 行。
+  默认 3300MB 按 8 worker 设计；调整 --workers 时按 (显存MB-2000)/workers 同步调整。
+
 以下为 V5 说明（Watch/AirPods 锚点增强，V6/V7 未改动核心检测）：
 
 V5 相对 V4 的核心改动：
@@ -175,7 +183,16 @@ DEFAULT_EXTRA_RETRY_PASSES = 1
 
 # V7.1：worker 每处理 N 行主动调用 paddle.device.cuda.empty_cache() 归还空闲显存。
 # 多进程共享单卡时 auto_growth 缓存只增不还，是 0803 批次显存挤兑事故的根因。
-GPU_CACHE_RELEASE_EVERY_ROWS = 10
+# V7.3：10 → 5，配合每进程显存硬上限进一步压缩囤积窗口。
+GPU_CACHE_RELEASE_EVERY_ROWS = 5
+
+# V7.3：每 worker 进程显存硬上限（MB，FLAGS_gpu_memory_limit_mb；0=不限制）。
+# V7.2 实测：清缓存+退避重试救不了"显存被邻居进程囤走"的场景（连紫贴小图都会
+# OOM）——empty_cache 只能清本进程的缓存。硬上限让任何进程到达自己额度时必须
+# 回收自己的空闲缓存，而不是伸手抢占全卡剩余，从机制上杜绝跨进程囤积挤兑。
+# 默认按 8 worker × 3300MB ≈ 26.4GB 设计（32GB 卡留 ~5GB 给桌面与峰值余量）；
+# 调整 --workers 时请同步调整：limit ≈ (显存总量MB - 2000) / workers。
+DEFAULT_GPU_MEM_LIMIT_MB = 3300
 
 # V7.2：OOM 当场消化。
 # 整图 OCR 跨进程并发闸：只有长边 ≥ OCR_GATE_MIN_SIDE 的输入占名额，防止多个
@@ -402,7 +419,8 @@ _ocr_semaphore = None
 def init_worker_ocr(gpu_mem_fraction: float | None = None,
                     download_workers: int = DOWNLOAD_WORKERS,
                     download_semaphore=None,
-                    ocr_semaphore=None):
+                    ocr_semaphore=None,
+                    gpu_mem_limit_mb: int = 0):
     """在 worker 进程内初始化 PaddleOCR + 下载线程池。
 
     必须在导入 paddle 之前设置 FLAGS 环境变量，因此 paddleocr 的 import 放在这里。
@@ -421,6 +439,11 @@ def init_worker_ocr(gpu_mem_fraction: float | None = None,
     if gpu_mem_fraction is not None:
         # 高级调优：显式限制每进程可用显存比例（auto_growth 下通常无需设置）
         os.environ["FLAGS_fraction_of_gpu_memory_to_use"] = str(gpu_mem_fraction)
+    if gpu_mem_limit_mb and gpu_mem_limit_mb > 0:
+        # V7.3：每进程显存硬上限。到达额度时 paddle 会先回收本进程空闲缓存，
+        # 仍不足才 OOM（由 ocr_image_full 的清缓存+退避重试兜底）。杜绝单进程
+        # 无限囤积把邻居挤到 OOM——邻居清自己的缓存救不了被本进程囤走的显存。
+        os.environ["FLAGS_gpu_memory_limit_mb"] = str(int(gpu_mem_limit_mb))
 
     from paddleocr import PaddleOCR
 
@@ -2338,7 +2361,8 @@ def worker_main(worker_id: int,
                 progress_lock,
                 round_id: int = 0,
                 download_semaphore=None,
-                ocr_semaphore=None):
+                ocr_semaphore=None,
+                gpu_mem_limit_mb: int = 0):
     """单个 worker 进程：初始化自己的 PaddleOCR，串行处理分到的行（内部预取下载），
     结果写入自己的分片文件。逐行详细日志重定向到分片 .log 文件，保持终端整洁。
 
@@ -2359,7 +2383,7 @@ def worker_main(worker_id: int,
     try:
         note(f"{tag} 初始化 PaddleOCR … ({len(df_shard)} 行待处理)")
         init_worker_ocr(gpu_mem_fraction, download_workers, download_semaphore,
-                        ocr_semaphore)
+                        ocr_semaphore, gpu_mem_limit_mb=gpu_mem_limit_mb)
         note(f"{tag} PaddleOCR 就绪，开始处理")
     except Exception as e:
         note(f"{tag} ✗ PaddleOCR 初始化失败: {type(e).__name__}: {e}")
@@ -2484,6 +2508,10 @@ def parse_args():
                    help='每个 worker 预取下载的行数')
     p.add_argument('--gpu-mem-fraction', type=float, default=None,
                    help='显式限制每进程显存比例（缺省用 auto_growth 按需分配）')
+    p.add_argument('--gpu-mem-limit-mb', type=int, default=DEFAULT_GPU_MEM_LIMIT_MB,
+                   help=f'每 worker 进程显存硬上限 MB（缺省 {DEFAULT_GPU_MEM_LIMIT_MB}，'
+                        '0=不限制）。防止单进程 auto_growth 缓存无限囤积把邻居进程'
+                        '挤到 OOM；调整 --workers 时按 (显存MB-2000)/workers 同步调整')
     p.add_argument('--progress-interval', type=float, default=5.0,
                    help='主进程聚合进度刷新间隔（秒）')
     p.add_argument('--download-concurrency', type=int,
@@ -2540,7 +2568,7 @@ def _run_worker_round(pending_df: pd.DataFrame, total_rows: int, output_csv: str
             args=(k, shards[k], total_rows, output_csv,
                   args.gpu_mem_fraction, args.download_workers, args.prefetch,
                   progress_counter, progress_lock, round_id, download_semaphore,
-                  ocr_semaphore),
+                  ocr_semaphore, args.gpu_mem_limit_mb),
             name=f"ocr-worker-{k}" if round_id == 0 else f"ocr-retry{round_id}-worker-{k}",
         )
         p.start()
@@ -2600,6 +2628,10 @@ def main():
     print(f"下载并发上限: {args.download_concurrency}（全局，跨所有 worker 进程共享）")
     print(f"整图OCR并发上限: {args.ocr_concurrency}"
           f"（全局，仅长边≥{OCR_GATE_MIN_SIDE}px 的大图推理占名额）")
+    print(f"每进程显存硬上限: "
+          f"{str(args.gpu_mem_limit_mb) + 'MB' if args.gpu_mem_limit_mb else '不限制'}"
+          f"（workers={args.workers}，合计约 "
+          f"{args.gpu_mem_limit_mb * args.workers // 1024 if args.gpu_mem_limit_mb else 0}GB）")
     print(f"自动补下载重试轮数: {args.extra_retry_passes}（0=关闭）")
     print(f"分片文件:    {os.path.splitext(output_csv)[0]}.wshard*.csv / .jsonl / .log")
     print("=" * 80)

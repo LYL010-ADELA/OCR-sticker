@@ -75,6 +75,16 @@ V7.3 根治（同日）：每进程显存硬上限（--gpu-mem-limit-mb，默认
   FLAGS_gpu_memory_limit_mb 让每个进程到达自己额度时必须回收自己的空闲缓存，
   而不是伸手抢占全卡剩余，从机制上杜绝跨进程挤兑；配合缓存释放频率 10→5 行。
   默认 3300MB 按 8 worker 设计；调整 --workers 时按 (显存MB-2000)/workers 同步调整。
+  实测结论：3000px 整图 OCR 每进程真实工作集约 4-5GB，8×3300 会让每次大图推理
+  撞自己额度（速度崩到 0.3 行/秒）——推荐 --workers 6 --gpu-mem-limit-mb 4500
+  （实测 2.6-2.7 行/秒），宁少进程、勿紧额度。
+
+V7.4 自愈（同日）：OOM 死循环自动重建 OCR 引擎
+  实测：worker 中过一次 OOM 后可能进入"每行必 OOM"死循环——异常路径在 paddle
+  内部泄漏的活跃张量占死本进程额度，empty_cache 无法释放活跃块，该 worker 分片
+  剩余行以每行 ~40s 的速度全部报废，并把整个 run 吊死在这一个分片上。
+  worker 连续 OOM_REINIT_AFTER_CONSECUTIVE_ROWS(=2) 行 OOM 失败即整体销毁重建
+  PaddleOCR predictor（释放其持有的全部显存，代价 ~10s 模型加载），继续处理。
 
 以下为 V5 说明（Watch/AirPods 锚点增强，V6/V7 未改动核心检测）：
 
@@ -185,6 +195,11 @@ DEFAULT_EXTRA_RETRY_PASSES = 1
 # 多进程共享单卡时 auto_growth 缓存只增不还，是 0803 批次显存挤兑事故的根因。
 # V7.3：10 → 5，配合每进程显存硬上限进一步压缩囤积窗口。
 GPU_CACHE_RELEASE_EVERY_ROWS = 5
+
+# V7.4：worker 连续 N 行因 GPU OOM 失败即自动销毁重建 OCR 引擎。单次 OOM 的
+# 异常路径可能在 paddle 内部泄漏活跃张量——之后 empty_cache 也救不回来（只能
+# 释放空闲块），该进程从此每次大图推理都 OOM（每行 ~40s 全部报废的死循环）。
+OOM_REINIT_AFTER_CONSECUTIVE_ROWS = 2
 
 # V7.3：每 worker 进程显存硬上限（MB，FLAGS_gpu_memory_limit_mb；0=不限制）。
 # V7.2 实测：清缓存+退避重试救不了"显存被邻居进程囤走"的场景（连紫贴小图都会
@@ -445,9 +460,13 @@ def init_worker_ocr(gpu_mem_fraction: float | None = None,
         # 无限囤积把邻居挤到 OOM——邻居清自己的缓存救不了被本进程囤走的显存。
         os.environ["FLAGS_gpu_memory_limit_mb"] = str(int(gpu_mem_limit_mb))
 
-    from paddleocr import PaddleOCR
+    ocr = _create_ocr_pipeline()
+    _dl_executor = ThreadPoolExecutor(max_workers=download_workers)
 
-    ocr = PaddleOCR(
+
+def _create_ocr_pipeline():
+    from paddleocr import PaddleOCR
+    return PaddleOCR(
         use_textline_orientation=True,
         lang='ch',
         device='gpu',
@@ -455,7 +474,21 @@ def init_worker_ocr(gpu_mem_fraction: float | None = None,
         text_det_limit_side_len=OCR_DET_LIMIT_SIDE_LEN,
         text_det_limit_type=OCR_DET_LIMIT_TYPE,
     )
-    _dl_executor = ThreadPoolExecutor(max_workers=download_workers)
+
+
+def reinit_ocr_predictor():
+    """销毁并重建本进程的 PaddleOCR 引擎（V7.4，治 OOM 死循环）。
+
+    实测：worker 中过一次 OOM 后可能进入"每行必 OOM"死循环——异常路径泄漏的
+    活跃张量占死了本进程显存额度，empty_cache 无法释放活跃块。整体销毁 predictor
+    是唯一可靠的释放手段；重建代价约 10s 模型加载。
+    """
+    global ocr
+    ocr = None
+    import gc
+    gc.collect()
+    _release_gpu_cache()
+    ocr = _create_ocr_pipeline()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2417,6 +2450,8 @@ def worker_main(worker_id: int,
 
     ensure_prefetched(0)
 
+    consecutive_oom_rows = 0  # V7.4：连续 OOM 行计数，达到阈值即重建 OCR 引擎
+
     for pi, (idx, row) in enumerate(rows):
         ensure_prefetched(pi + 1)
         tasks    = prefetch_cache.pop(idx, None)
@@ -2426,6 +2461,7 @@ def worker_main(worker_id: int,
             r = process_row(row, idx + 1, total_rows, prefetched_tasks=tasks)
             result_row = _result_to_row(row, r)
             save_result_immediately(result_row, csv_shard, json_shard)
+            consecutive_oom_rows = 0
             # 逐行结果详情见分片 .log；终端只显示主进程聚合进度条
         except Exception as e:
             print(f"  ✗ 处理异常 (订单号: {order_id}): {type(e).__name__}: {e}")
@@ -2435,6 +2471,24 @@ def worker_main(worker_id: int,
                 error_row[col] = f"ERROR: {str(e)[:80]}" if col == '位置说明' else None
             save_result_immediately(error_row, csv_shard, json_shard)
             note(f"{tag} 行{idx + 1} 订单{order_id} → ✗ 异常: {str(e)[:60]}")
+
+            # V7.4：OOM 死循环自愈——连续 OOM 行达到阈值即销毁重建 OCR 引擎，
+            # 释放异常路径泄漏的活跃张量；否则该 worker 分片剩余行会全部报废。
+            if 'GPU显存不足' in str(e):
+                consecutive_oom_rows += 1
+                if consecutive_oom_rows >= OOM_REINIT_AFTER_CONSECUTIVE_ROWS:
+                    note(f"{tag} ⚠ 连续 {consecutive_oom_rows} 行 GPU OOM，"
+                         f"疑似显存泄漏死循环，销毁重建 OCR 引擎 …")
+                    try:
+                        reinit_ocr_predictor()
+                        consecutive_oom_rows = 0
+                        note(f"{tag} ✓ OCR 引擎重建完成，继续处理")
+                    except Exception as rex:
+                        note(f"{tag} ✗ OCR 引擎重建失败: {type(rex).__name__}: "
+                             f"{str(rex)[:80]}；worker 退出，重跑脚本可续传")
+                        sys.exit(1)
+            else:
+                consecutive_oom_rows = 0
 
         with progress_lock:
             progress_counter.value += 1

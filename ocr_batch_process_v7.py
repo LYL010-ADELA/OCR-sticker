@@ -44,6 +44,30 @@ V7 补充：下载稳健性改进（解决"下载速度跟不上识别速度，�
      注：该重试轮不区分"真下载失败"与"确实没贴封口贴"，两者都会被重试一次，
      属于有意为之的取舍（换取召回率），多数情况下额外耗时有限。
 
+V7.1 热修（2026-08-04，0803 批次事故复盘）：显存挤兑导致整图 OCR 大面积静默失败
+  事故：12 个 worker 进程的 paddle auto_growth 显存缓存只增不还，跑数小时后
+  32GB 单卡仅剩几十 MB 可分配（12 进程合计囤 31GB、实际在用不到 2GB）；
+  3000px 整图 OCR 需要的 400~800MB 大块激活分配集体 OOM，异常被 ocr_image_full
+  的 except 吞掉后返回空文本 → 约 65% 行被误判"未找到背面图"；同时每次 OOM
+  前 paddle 的 GC/重试等待把速率从 ~2 行/秒拖到 0.14 行/秒（CPU/GPU 双双空转，
+  仅输入尺寸小的紫贴裁剪 OCR 能挤进显存碎片存活）。
+  1. worker 每处理 GPU_CACHE_RELEASE_EVERY_ROWS 行主动 empty_cache() 归还空闲
+     显存，根治多进程缓存挤兑；
+  2. OCR 遇显存 OOM：先清本进程缓存重试一次，仍失败则向上抛出 → 该行记 ERROR
+     （重跑可续传），绝不再静默当成"图上没字"；
+  3. 旋转扫描（90/180/270）只保留紫色封贴局部 OCR，去掉旋转整图 OCR——0803
+     批次实测 1746 次命中中旋转整图 OCR 仅贡献 1 次，却是显存峰值与耗时的
+     主要来源；且旋转轮后置为第二轮：所有图 0° 均未命中才逐图旋转，不再
+     "第 1 张图 4 角度试完才看第 2 张"；
+  4. 每 worker 默认 OMP_NUM_THREADS=4，避免多进程 CPU 线程互相踩踏。
+
+V7.2 加固（同日）：瞬时 OOM 当场消化（V7.1 重跑首 5min 实测约 2.5% 行仍撞峰值）
+  1. 整图 OCR 增加跨进程并发闸（--ocr-concurrency，默认 5）：仅长边≥1500px 的
+     大图推理占名额，防止 8 个 worker 同时到达 3000px 推理显存峰值互相挤兑；
+     紫贴裁剪小图/水印 OCR 不占名额、不受影响。
+  2. OOM 处理从"清缓存立即重试 1 次"改为"清缓存 + 退避 0.5/1/2s，最多 3 次"：
+     瞬时峰值几秒内自然消散，绝大多数行当场恢复，不再攒到结尾的自动重试轮。
+
 以下为 V5 说明（Watch/AirPods 锚点增强，V6/V7 未改动核心检测）：
 
 V5 相对 V4 的核心改动：
@@ -148,6 +172,18 @@ DEFAULT_GLOBAL_DOWNLOAD_CONCURRENCY = 32
 
 # V7：主批次跑完后，自动对"封口贴存在≠1"的行做的补下载重试轮数（0=关闭）。
 DEFAULT_EXTRA_RETRY_PASSES = 1
+
+# V7.1：worker 每处理 N 行主动调用 paddle.device.cuda.empty_cache() 归还空闲显存。
+# 多进程共享单卡时 auto_growth 缓存只增不还，是 0803 批次显存挤兑事故的根因。
+GPU_CACHE_RELEASE_EVERY_ROWS = 10
+
+# V7.2：OOM 当场消化。
+# 整图 OCR 跨进程并发闸：只有长边 ≥ OCR_GATE_MIN_SIDE 的输入占名额，防止多个
+# 进程同时到达 3000px 推理的显存峰值互相挤兑；裁剪小图/水印 OCR 不占名额。
+DEFAULT_OCR_CONCURRENCY = 5
+OCR_GATE_MIN_SIDE       = 1500
+# OOM 清缓存后的退避重试次数（0.5s/1s/2s 递增），瞬时峰值几秒内自然消散。
+OCR_OOM_MAX_RETRIES     = 3
 
 # 整图 OCR 输入尺寸。PaddleOCR 默认 text_det_limit_type='min' 会把短边放大到
 # side_len，竖长图/横长图会被内部放成 5000~7000px 后再缩回 max_side_limit=4000，
@@ -358,22 +394,30 @@ _dl_executor = None
 # 创建后传给每个 worker，在 init_worker_ocr() 中存入本进程全局，供 download_image()
 # 在发起每次 HTTP 请求前 acquire/release，实现"全局并发上限"而非"每进程各自上限"。
 _download_semaphore = None
+# V7.2：跨 worker 进程共享的整图 OCR 并发闸。只在大图（长边≥OCR_GATE_MIN_SIDE）
+# 推理时占名额，把同时到达显存峰值的进程数卡在 --ocr-concurrency 内。
+_ocr_semaphore = None
 
 
 def init_worker_ocr(gpu_mem_fraction: float | None = None,
                     download_workers: int = DOWNLOAD_WORKERS,
-                    download_semaphore=None):
+                    download_semaphore=None,
+                    ocr_semaphore=None):
     """在 worker 进程内初始化 PaddleOCR + 下载线程池。
 
     必须在导入 paddle 之前设置 FLAGS 环境变量，因此 paddleocr 的 import 放在这里。
     多进程共用一块 GPU 时用 auto_growth 分配策略：每个进程只按需申请显存，
     避免某个进程一次性抢占过大比例导致其他进程 OOM。
     """
-    global ocr, _dl_executor, _download_semaphore
+    global ocr, _dl_executor, _download_semaphore, _ocr_semaphore
     _download_semaphore = download_semaphore
+    _ocr_semaphore = ocr_semaphore
 
     # auto_growth：多进程共享单卡的关键。每进程按需增长显存，而非预占固定比例。
     os.environ.setdefault("FLAGS_allocator_strategy", "auto_growth")
+    # V7.1：限制每 worker 的 CPU 线程数。多 worker 时若各自用默认线程数（=全部核心），
+    # OCR 前后处理的 CPU 阶段会互相踩踏，上下文切换开销显著。
+    os.environ.setdefault("OMP_NUM_THREADS", "4")
     if gpu_mem_fraction is not None:
         # 高级调优：显式限制每进程可用显存比例（auto_growth 下通常无需设置）
         os.environ["FLAGS_fraction_of_gpu_memory_to_use"] = str(gpu_mem_fraction)
@@ -506,15 +550,48 @@ def submit_row_downloads(row) -> list[tuple]:
 # 三、OCR
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def ocr_image_full(image: Image.Image, image_id: str = "unknown"):
+def _is_gpu_oom_error(e: Exception) -> bool:
+    """paddle 的显存不足没有稳定的 Python 异常类型（常包装成 MemoryError），按消息识别。"""
+    msg = repr(e)
+    return isinstance(e, MemoryError) or "ResourceExhausted" in msg or "Out of memory" in msg
+
+
+def _release_gpu_cache() -> None:
+    """把本进程 auto_growth 分配器囤积的空闲显存块归还给 CUDA 驱动。
+
+    多 worker 共享单卡时每个进程的缓存池只增不还：0803 批次跑数小时后，
+    32GB 卡只剩 68MB 可分配（12 进程合计囤 31GB、实际在用不到 2GB），
+    3000px 整图 OCR 的大块激活分配集体 OOM，而小裁剪图仍能挤进碎片。
+    worker 定期主动归还即可根治挤兑。
+    """
+    try:
+        import paddle
+        paddle.device.cuda.empty_cache()
+    except Exception as e:
+        print(f"  ⚠ 释放显存缓存失败(忽略): {type(e).__name__}: {str(e)[:80]}")
+
+
+def ocr_image_full(image: Image.Image, image_id: str = "unknown",
+                   _oom_attempt: int = 0):
     if image is None:
         return "", [], [], 0, 0
     try:
         orig_w, orig_h = image.size
         image_resized = resize_for_ocr(image, max_side=OCR_MAX_SIDE)
         res_w, res_h = image_resized.size
+        img_cv = pil_to_cv(image_resized)
 
-        result = ocr.predict(input=pil_to_cv(image_resized))
+        # V7.2：大图推理占用跨进程并发闸，防止多个进程同时到达显存峰值互相挤兑；
+        # 裁剪小图/水印（长边 < OCR_GATE_MIN_SIDE）不占名额，不受影响。
+        use_gate = (_ocr_semaphore is not None
+                    and max(res_w, res_h) >= OCR_GATE_MIN_SIDE)
+        if use_gate:
+            _ocr_semaphore.acquire()
+        try:
+            result = ocr.predict(input=img_cv)
+        finally:
+            if use_gate:
+                _ocr_semaphore.release()
 
         texts, polys_res = [], []
         if result and len(result) > 0:
@@ -533,6 +610,20 @@ def ocr_image_full(image: Image.Image, image_id: str = "unknown"):
         return " ".join(texts), texts, polys_orig, orig_h, orig_w
 
     except Exception as e:
+        if _is_gpu_oom_error(e):
+            if _oom_attempt < OCR_OOM_MAX_RETRIES:
+                wait_s = 0.5 * (2 ** _oom_attempt)  # 0.5s → 1s → 2s
+                print(f"  OCR 显存不足({image_id})，清缓存并等待 {wait_s:.1f}s 后重试"
+                      f"（第{_oom_attempt + 1}/{OCR_OOM_MAX_RETRIES}次）…")
+                _release_gpu_cache()
+                time.sleep(wait_s)
+                return ocr_image_full(image, image_id, _oom_attempt + 1)
+            # 退避重试后仍 OOM：向上抛出，让该行被记为 ERROR（重跑可续传）。
+            # 绝不能静默返回空文本——那会被误判成"图上没字/没有封口贴"，
+            # 0803 批次约 65% 的行就是这样被污染的。
+            raise RuntimeError(
+                f"GPU显存不足，OCR失败（已退避重试{OCR_OOM_MAX_RETRIES}次）: "
+                f"{image_id}") from e
         print("  OCR 识别异常:", type(e).__name__, repr(e))
         print(traceback.format_exc())
         return "", [], [], 0, 0
@@ -1574,43 +1665,78 @@ def _make_result(is_compliant, seal_exists, position_valid,
 
 
 def find_back_image_by_scan_anchor(image: Image.Image, lob: str, image_id: str) -> dict | None:
-    """通过整图 OCR、旋转 OCR、紫色封贴局部 OCR 查找背面图。"""
-    angles = scan_ocr_angles_for_lob(lob)
-    for angle in angles:
-        scan_image = rotate_image_for_scan_ocr(image, angle)
-        angle_id = f"{image_id}_rot{angle}"
-        full_text, texts, polys_orig, orig_h, orig_w = ocr_image_full(scan_image, angle_id)
-        angle_note = "原图" if angle == 0 else f"旋转{angle}°"
-        print(f"  {angle_note} OCR文字: {full_text[:120]}{'...' if len(full_text) > 120 else ''}")
+    """第一轮扫描：0° 整图 OCR + 0° 紫色封贴局部 OCR 查找背面图。
 
-        if has_scan_text(texts):
-            return {
-                "image": scan_image, "texts": texts, "polys_orig": polys_orig,
-                "orig_h": orig_h, "orig_w": orig_w,
-                "scan_angle": angle, "scan_method": "full_ocr",
-            }
+    V7.1：旋转扫描拆分到 _rotated_crop_scan()，由 process_row 在所有图片
+    0° 均未命中后作为第二轮统一执行（背面图绝大多数 0° 即可命中，先把
+    每张图的 0° 都试完，比在第 1 张图上烧完 4 个角度更快找到背面）。
+    """
+    full_text, texts, polys_orig, orig_h, orig_w = ocr_image_full(image, image_id)
+    print(f"  原图 OCR文字: {full_text[:120]}{'...' if len(full_text) > 120 else ''}")
 
-        if lob in SCAN_LOCAL_CROP_LOBS or is_accessory_lob(lob):
-            crop_hit = ocr_scan_candidate_crops(scan_image, texts, polys_orig, angle_id)
-            if crop_hit is None:
-                continue
+    if has_scan_text(texts):
+        return {
+            "image": image, "texts": texts, "polys_orig": polys_orig,
+            "orig_h": orig_h, "orig_w": orig_w,
+            "scan_angle": 0, "scan_method": "full_ocr",
+        }
+
+    if lob in SCAN_LOCAL_CROP_LOBS or is_accessory_lob(lob):
+        crop_hit = ocr_scan_candidate_crops(image, texts, polys_orig, image_id)
+        if crop_hit is not None:
             cand_count = int(crop_hit.get("candidate_count", 0))
             crop_box = crop_hit.get("crop_box")
             if crop_box:
-                print(f"  {angle_note} 紫色封贴局部OCR命中'扫码即领'，"
+                print(f"  原图 紫色封贴局部OCR命中'扫码即领'，"
                       f"候选数={cand_count}，crop={crop_box}")
                 return {
-                    "image": scan_image,
+                    "image": image,
                     "texts": crop_hit["texts"],
                     "polys_orig": crop_hit["polys_orig"],
-                    "orig_h": scan_image.size[1],
-                    "orig_w": scan_image.size[0],
-                    "scan_angle": angle,
+                    "orig_h": image.size[1],
+                    "orig_w": image.size[0],
+                    "scan_angle": 0,
                     "scan_method": "purple_crop_ocr",
                 }
             if cand_count:
-                print(f"  {angle_note} 找到紫色封贴候选 {cand_count} 个，局部OCR未命中")
+                print(f"  原图 找到紫色封贴候选 {cand_count} 个，局部OCR未命中")
 
+    return None
+
+
+def _rotated_crop_scan(image: Image.Image, lob: str, image_id: str) -> dict | None:
+    """第二轮扫描：90/180/270 旋转后只做紫色封贴局部 OCR。
+
+    V7.1 起不再做旋转整图 OCR：0803 批次实测 1746 次命中中旋转整图 OCR 仅
+    贡献 1 次，而旋转裁剪贡献 239 次；整图 OCR 的 3000px 大块显存激活正是
+    多进程显存挤兑的主要来源，裁剪小图保住了旋转扫描几乎全部的实际召回。
+    """
+    if not (lob in SCAN_LOCAL_CROP_LOBS or is_accessory_lob(lob)):
+        return None
+    for angle in scan_ocr_angles_for_lob(lob):
+        if angle == 0:
+            continue
+        scan_image = rotate_image_for_scan_ocr(image, angle)
+        angle_id = f"{image_id}_rot{angle}"
+        crop_hit = ocr_scan_candidate_crops(scan_image, [], [], angle_id)
+        if crop_hit is None:
+            continue
+        cand_count = int(crop_hit.get("candidate_count", 0))
+        crop_box = crop_hit.get("crop_box")
+        if crop_box:
+            print(f"  旋转{angle}° 紫色封贴局部OCR命中'扫码即领'，"
+                  f"候选数={cand_count}，crop={crop_box}")
+            return {
+                "image": scan_image,
+                "texts": crop_hit["texts"],
+                "polys_orig": crop_hit["polys_orig"],
+                "orig_h": scan_image.size[1],
+                "orig_w": scan_image.size[0],
+                "scan_angle": angle,
+                "scan_method": "purple_crop_ocr",
+            }
+        if cand_count:
+            print(f"  旋转{angle}° 找到紫色封贴候选 {cand_count} 个，局部OCR未命中")
     return None
 
 
@@ -1655,9 +1781,11 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
 
     # Phase 1: 找第一张含"扫码即领"的图作为背面
     # V3 改动：找到即停，不再扫描所有图片
+    # V7.1 改动：先把所有图的 0° 扫完（第一轮），全未命中才逐图旋转裁剪（第二轮）
     back = None
     download_success = 0
     download_failures = []
+    rotation_candidates = []  # 0° 未命中的图，留给第二轮旋转裁剪扫描
     for col_idx, col, url, future in tasks:
         print(f"\n  第{col_idx}张图片: {url[:80]}...")
         try:
@@ -1712,6 +1840,18 @@ def process_row(row, idx: int, total: int, prefetched_tasks=None) -> dict:
             break
         else:
             print(f"  → 未检测到'扫码即领'，继续下一张")
+            rotation_candidates.append((col_idx, image, image_id))
+
+    # V7.1 第二轮：所有图 0° 均未命中时，对可旋转 LOB（Watch/AirPods/配件）
+    # 逐图做旋转紫贴裁剪扫描。
+    if back is None and rotation_candidates:
+        for rc_col_idx, rc_image, rc_image_id in rotation_candidates:
+            hit = _rotated_crop_scan(rc_image, lob, rc_image_id)
+            if hit is not None:
+                back = hit
+                print(f"  → ✓ 通过 旋转{hit['scan_angle']}°/{hit['scan_method']} "
+                      f"检测到'扫码即领'（第{rc_col_idx}张图，第二轮旋转裁剪），确认为背面")
+                break
 
     # 无背面图 → 不合格
     if back is None:
@@ -2197,7 +2337,8 @@ def worker_main(worker_id: int,
                 progress_counter,
                 progress_lock,
                 round_id: int = 0,
-                download_semaphore=None):
+                download_semaphore=None,
+                ocr_semaphore=None):
     """单个 worker 进程：初始化自己的 PaddleOCR，串行处理分到的行（内部预取下载），
     结果写入自己的分片文件。逐行详细日志重定向到分片 .log 文件，保持终端整洁。
 
@@ -2217,7 +2358,8 @@ def worker_main(worker_id: int,
 
     try:
         note(f"{tag} 初始化 PaddleOCR … ({len(df_shard)} 行待处理)")
-        init_worker_ocr(gpu_mem_fraction, download_workers, download_semaphore)
+        init_worker_ocr(gpu_mem_fraction, download_workers, download_semaphore,
+                        ocr_semaphore)
         note(f"{tag} PaddleOCR 就绪，开始处理")
     except Exception as e:
         note(f"{tag} ✗ PaddleOCR 初始化失败: {type(e).__name__}: {e}")
@@ -2272,6 +2414,10 @@ def worker_main(worker_id: int,
 
         with progress_lock:
             progress_counter.value += 1
+
+        # V7.1：定期归还空闲显存，防止多进程 auto_growth 缓存挤兑（0803 事故根因）
+        if (pi + 1) % GPU_CACHE_RELEASE_EVERY_ROWS == 0:
+            _release_gpu_cache()
 
     note(f"{tag} ✓ 分片完成，共处理 {len(rows)} 行")
 
@@ -2345,6 +2491,11 @@ def parse_args():
                    help='全局下载并发上限，跨所有 worker 进程共享（缺省 32）。'
                         '防止 --workers × --download-workers 的乘积压垮图片服务器/CDN，'
                         '导致高并发下大量下载超时失败')
+    p.add_argument('--ocr-concurrency', type=int,
+                   default=DEFAULT_OCR_CONCURRENCY,
+                   help=f'整图 OCR 全局并发上限（缺省 {DEFAULT_OCR_CONCURRENCY}）。'
+                        f'仅长边≥{OCR_GATE_MIN_SIDE}px 的大图推理占名额，'
+                        '防止多个 worker 同时到达显存峰值互相挤兑（瞬时 OOM）')
     p.add_argument('--extra-retry-passes', type=int,
                    default=DEFAULT_EXTRA_RETRY_PASSES,
                    help='主批次跑完后，自动对"封口贴存在≠1"的行做的补下载重试轮数'
@@ -2360,7 +2511,8 @@ def parse_args():
 
 
 def _run_worker_round(pending_df: pd.DataFrame, total_rows: int, output_csv: str,
-                      args, round_id: int, ctx, download_semaphore) -> bool:
+                      args, round_id: int, ctx, download_semaphore,
+                      ocr_semaphore=None) -> bool:
     """跑一轮 worker：round_id=0 为主批次，round_id>=1 为 V7 自动补下载重试轮。
 
     返回 True 表示本轮所有 worker 正常退出（无异常）；False 表示有 worker 崩溃
@@ -2387,7 +2539,8 @@ def _run_worker_round(pending_df: pd.DataFrame, total_rows: int, output_csv: str
             target=worker_main,
             args=(k, shards[k], total_rows, output_csv,
                   args.gpu_mem_fraction, args.download_workers, args.prefetch,
-                  progress_counter, progress_lock, round_id, download_semaphore),
+                  progress_counter, progress_lock, round_id, download_semaphore,
+                  ocr_semaphore),
             name=f"ocr-worker-{k}" if round_id == 0 else f"ocr-retry{round_id}-worker-{k}",
         )
         p.start()
@@ -2445,6 +2598,8 @@ def main():
     print(f"输出 Excel:  {output_excel}")
     print(f"worker 数:   {args.workers}  (CPU 核数={os.cpu_count()})")
     print(f"下载并发上限: {args.download_concurrency}（全局，跨所有 worker 进程共享）")
+    print(f"整图OCR并发上限: {args.ocr_concurrency}"
+          f"（全局，仅长边≥{OCR_GATE_MIN_SIDE}px 的大图推理占名额）")
     print(f"自动补下载重试轮数: {args.extra_retry_passes}（0=关闭）")
     print(f"分片文件:    {os.path.splitext(output_csv)[0]}.wshard*.csv / .jsonl / .log")
     print("=" * 80)
@@ -2482,9 +2637,12 @@ def main():
     # V7：全局下载并发闸，跨所有 worker 进程共享，防止 --workers × --download-workers
     # 的乘积压垮图片服务器/CDN（见文件顶部 V7 补充说明）。
     download_semaphore = ctx.BoundedSemaphore(max(1, args.download_concurrency))
+    # V7.2：整图 OCR 跨进程并发闸——同时做大图推理的进程数上限，防止显存峰值叠加
+    ocr_semaphore = ctx.BoundedSemaphore(max(1, args.ocr_concurrency))
 
     all_ok = _run_worker_round(pending_df, total_rows, output_csv, args,
-                               round_id=0, ctx=ctx, download_semaphore=download_semaphore)
+                               round_id=0, ctx=ctx, download_semaphore=download_semaphore,
+                               ocr_semaphore=ocr_semaphore)
 
     # V7：自动补下载重试轮 —— 把"手动重跑一次"内建进单次运行。主批次高并发下载
     # 拥堵导致的瞬时失败，会在这里以低得多的并发（剩余行数远少于主批次）自动重试，
@@ -2498,13 +2656,30 @@ def main():
         if not retry_ids:
             break
         round_id += 1
+        # 诊断：本轮待重试行的 LOB 分布——若明显集中在配件（非核心5类），说明这批
+        # "未找到背面图"更可能是配件本身检测难/真实无贴，而非下载拥堵，重试收益有限。
+        retry_lob_counts = (df[df['订单号'].astype(str).isin(retry_ids)]['LOB']
+                            .astype(str).value_counts().to_dict())
         print(f"\n发现 {len(retry_ids)} 行未识别到封口贴/背面图（疑似下载问题），"
               f"启动第 {round_id} 轮自动补下载重试…")
+        print(f"  本轮 LOB 分布：{retry_lob_counts}")
         retry_df = df[df['订单号'].astype(str).isin(retry_ids)]
         all_ok = _run_worker_round(retry_df, total_rows, output_csv, args,
                                    round_id=round_id, ctx=ctx,
-                                   download_semaphore=download_semaphore)
-        current_ids = set(retry_ids)
+                                   download_semaphore=download_semaphore,
+                                   ocr_semaphore=ocr_semaphore)
+
+        # 诊断：本轮实际恢复了多少行（0→1），而不是仅仅"跑完了"。恢复率低说明
+        # 大部分失败并非下载问题，加大并发/重试轮数意义有限，需要另查检测逻辑本身。
+        post_merged = _merge_frames(df, _collect_shard_frames(output_csv))
+        still_missing = set(_orders_missing_seal(post_merged, retry_ids))
+        recovered = len(retry_ids) - len(still_missing)
+        recovered_pct = recovered / len(retry_ids) * 100 if retry_ids else 0.0
+        print(f"[补下载重试第{round_id}轮] 恢复情况：{recovered}/{len(retry_ids)} 行本轮成功识别到"
+              f"封口贴（{recovered_pct:.1f}%），仍有 {len(still_missing)} 行未识别到。"
+              + ("恢复率偏低，大概率不是下载问题（真实无贴/OCR检测难点），"
+                 "继续调低并发或加重试轮数意义有限。" if recovered_pct < 30 else ""))
+        current_ids = still_missing
 
     # 合并所有轮次的分片 → 最终输出
     print("\n正在合并所有 worker 分片 …")

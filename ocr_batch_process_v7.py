@@ -86,6 +86,26 @@ V7.4 自愈（同日）：OOM 死循环自动重建 OCR 引擎
   worker 连续 OOM_REINIT_AFTER_CONSECUTIVE_ROWS(=2) 行 OOM 失败即整体销毁重建
   PaddleOCR predictor（释放其持有的全部显存，代价 ~10s 模型加载），继续处理。
 
+V7.5（2026-08-06）：OOM 自愈从"进程内重建引擎"升级为"worker 退出 + 主进程自动重启"
+  0806 批次实测 V7.4 的进程内重建无效：重建完成后小图能过、大图立刻再 OOM，
+  且 4/6 个 worker 相继死亡——泄漏的活跃张量在 paddle C++ 侧，Python 端把
+  predictor 置 None + gc 收不回来，每次重建反而在每进程显存硬上限内再叠一份
+  模型，进程贴着自己额度空转（重建 30s + 每行退避 ~40s 全报废）。
+  1. worker 连续 OOM_EXIT_AFTER_CONSECUTIVE_ROWS(=2) 行 OOM → 直接退出
+     （退出码 WORKER_EXIT_OOM_RESPAWN=43），显存随进程终止由 CUDA 驱动整体
+     回收（唯一彻底的释放手段）；主进程识别该退出码后自动重启该 worker，
+     靠分片内断点续传接着跑。连续 OOM_RESPAWN_MAX_STRIKES(=3) 次重启之间
+     没有任何新增落盘行（原地 OOM 无进展）则放弃——那说明不是泄漏而是
+     配置问题（显存上限对这批大图太紧），盲目重启只会空转。
+  2. OOM 行不再落 "ERROR: GPU显存不足" 结果行：V7.4 落盘后，断点续传把它
+     当"已处理"永久跳过，自动补下载重试轮也不会再碰它（current_ids 只含本次
+     pending 行）——失败被永久固化进最终输出。现在 OOM 行保持未写入，由
+     重启后的进程 / 本轮补下载重试轮 / 下次重跑自然重试。
+  3. 历史污染兜底：_read_processed_orders 把遗留的 "ERROR:" 行视为未处理
+     （重跑自动重试）；_merge_frames 保证同一订单的正常结果行永远优先于
+     ERROR 行（不管落在哪个分片/轮次）。配套 purge_oom_error_rows.py 可把
+     已污染分片里的 OOM ERROR 行一次性物理清除。
+
 以下为 V5 说明（Watch/AirPods 锚点增强，V6/V7 未改动核心检测）：
 
 V5 相对 V4 的核心改动：
@@ -196,10 +216,18 @@ DEFAULT_EXTRA_RETRY_PASSES = 1
 # V7.3：10 → 5，配合每进程显存硬上限进一步压缩囤积窗口。
 GPU_CACHE_RELEASE_EVERY_ROWS = 5
 
-# V7.4：worker 连续 N 行因 GPU OOM 失败即自动销毁重建 OCR 引擎。单次 OOM 的
-# 异常路径可能在 paddle 内部泄漏活跃张量——之后 empty_cache 也救不回来（只能
-# 释放空闲块），该进程从此每次大图推理都 OOM（每行 ~40s 全部报废的死循环）。
-OOM_REINIT_AFTER_CONSECUTIVE_ROWS = 2
+# V7.4→V7.5：worker 连续 N 行因 GPU OOM 失败即自愈。V7.4 的"进程内销毁重建
+# predictor"实测救不回来：泄漏的活跃张量在 paddle C++ 侧，Python 端置 None +
+# gc 收不回来，每次重建反而在每进程显存硬上限内再叠一份模型，之后大图推理必
+# OOM（小图仍能挤进去）。V7.5 改为 worker 直接退出——显存随进程终止由 CUDA
+# 驱动整体回收，这是唯一彻底的释放手段——主进程识别退出码后自动重启该 worker，
+# 分片内断点续传接着跑。
+OOM_EXIT_AFTER_CONSECUTIVE_ROWS = 2
+# worker 请求"重启我"的专用退出码（区别于 0=正常完成、1=初始化失败等真崩溃）
+WORKER_EXIT_OOM_RESPAWN = 43
+# 连续 N 次重启之间没有任何新增落盘行（原地 OOM 无进展）则放弃该 worker：
+# 说明不是泄漏而是配置问题（如显存上限对这批大图太紧），盲目重启只会空转。
+OOM_RESPAWN_MAX_STRIKES = 3
 
 # V7.3：每 worker 进程显存硬上限（MB，FLAGS_gpu_memory_limit_mb；0=不限制）。
 # V7.2 实测：清缓存+退避重试救不了"显存被邻居进程囤走"的场景（连紫贴小图都会
@@ -476,19 +504,8 @@ def _create_ocr_pipeline():
     )
 
 
-def reinit_ocr_predictor():
-    """销毁并重建本进程的 PaddleOCR 引擎（V7.4，治 OOM 死循环）。
-
-    实测：worker 中过一次 OOM 后可能进入"每行必 OOM"死循环——异常路径泄漏的
-    活跃张量占死了本进程显存额度，empty_cache 无法释放活跃块。整体销毁 predictor
-    是唯一可靠的释放手段；重建代价约 10s 模型加载。
-    """
-    global ocr
-    ocr = None
-    import gc
-    gc.collect()
-    _release_gpu_cache()
-    ocr = _create_ocr_pipeline()
+# （V7.4 曾在此处提供 reinit_ocr_predictor() 做进程内销毁重建，V7.5 实测无效
+#   已移除——OOM 自愈改为 worker 退出 + 主进程自动重启，见 worker_main / _run_worker_round。）
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2321,6 +2338,13 @@ def _merge_frames(df: pd.DataFrame, frames: list[pd.DataFrame]) -> pd.DataFrame 
         return None
     merged = pd.concat(frames, ignore_index=True)
     if '订单号' in merged.columns:
+        if '位置说明' in merged.columns:
+            # V7.5：同一订单同时存在 ERROR 行与正常结果行时（重跑修复后，旧的
+            # ERROR 行可能残留在排序更靠后的分片文件里），保证正常结果获胜：
+            # 把 ERROR 行稳定地挪到最前，keep='last' 自然选中最后一条正常结果；
+            # 只剩 ERROR 行的订单仍保留其最后一条 ERROR。
+            is_err = merged['位置说明'].astype(str).str.startswith('ERROR:')
+            merged = pd.concat([merged[is_err], merged[~is_err]], ignore_index=True)
         merged = merged.drop_duplicates(subset='订单号', keep='last')
         order_to_pos = {str(oid): i for i, oid in enumerate(df['订单号'].astype(str))}
         merged['__pos__'] = merged['订单号'].astype(str).map(
@@ -2367,13 +2391,20 @@ def _read_processed_orders(output_csv: str) -> set[str]:
                 download_status = str(r.get('图片下载状态', '')).strip()
                 detail = str(r.get('位置说明', '')).strip()
                 position_valid = str(r.get('贴纸位置规范', '')).strip()
-                incomplete_download = (
+                needs_rerun = (
                     download_status == '下载不完整'
                     or detail.startswith('图片下载不完整')
                     or position_valid in {'-2', '-2.0'}
                 )
-                # 与 merge_shards 的 keep='last' 一致：后读到的同订单结果覆盖前面的状态。
-                processed_state[oid] = not incomplete_download
+                if detail.startswith('ERROR:'):
+                    # V7.5：ERROR 行（含 V7.4 落盘的 "ERROR: GPU显存不足…"）不算
+                    # 已处理——否则失败被永久固化进最终输出；但也不推翻同订单已有
+                    # 的正常结果，与 _merge_frames 的"正常结果永远优先于 ERROR 行"
+                    # 保持一致，避免已修复的订单被无谓重跑。
+                    processed_state.setdefault(oid, False)
+                else:
+                    # 与 merge_shards 的 keep='last' 一致：后读到的同订单结果覆盖前面的状态。
+                    processed_state[oid] = not needs_rerun
         except Exception as e:
             print(f"  ⚠ 解析分片内容失败（忽略，相关行将重跑）: {e}")
     return {oid for oid, is_done in processed_state.items() if is_done}
@@ -2395,13 +2426,17 @@ def worker_main(worker_id: int,
                 round_id: int = 0,
                 download_semaphore=None,
                 ocr_semaphore=None,
-                gpu_mem_limit_mb: int = 0):
+                gpu_mem_limit_mb: int = 0,
+                worker_progress=None):
     """单个 worker 进程：初始化自己的 PaddleOCR，串行处理分到的行（内部预取下载），
     结果写入自己的分片文件。逐行详细日志重定向到分片 .log 文件，保持终端整洁。
 
     V7：round_id>=1 时使用独立分片文件名（.retryN，见 _shard_paths），代表
     "自动补下载重试轮"；download_semaphore 是跨所有 worker 进程共享的全局下载
     并发闸，透传给 init_worker_ocr() 供 download_image() 使用。
+
+    V7.5：worker_progress 是跨进程共享的每 worker 已落盘行数数组——主进程用它
+    判断"OOM 重启后是否有实际进展"（连续多次重启零进展则放弃重启）。
     """
     csv_shard, json_shard, log_shard = _shard_paths(output_csv, worker_id, round_id)
     tag = f"[W{worker_id}]" if not round_id else f"[W{worker_id}][重试轮{round_id}]"
@@ -2450,48 +2485,65 @@ def worker_main(worker_id: int,
 
     ensure_prefetched(0)
 
-    consecutive_oom_rows = 0  # V7.4：连续 OOM 行计数，达到阈值即重建 OCR 引擎
+    consecutive_oom_rows = 0  # V7.5：连续 OOM 行计数，达到阈值即退出等待主进程重启
 
     for pi, (idx, row) in enumerate(rows):
         ensure_prefetched(pi + 1)
         tasks    = prefetch_cache.pop(idx, None)
         order_id = str(row.get('订单号', ''))
 
+        row_written = False
         try:
             r = process_row(row, idx + 1, total_rows, prefetched_tasks=tasks)
             result_row = _result_to_row(row, r)
             save_result_immediately(result_row, csv_shard, json_shard)
             consecutive_oom_rows = 0
+            row_written = True
             # 逐行结果详情见分片 .log；终端只显示主进程聚合进度条
         except Exception as e:
             print(f"  ✗ 处理异常 (订单号: {order_id}): {type(e).__name__}: {e}")
             print(traceback.format_exc())
-            error_row = row.to_dict()
-            for col in NEW_COLS:
-                error_row[col] = f"ERROR: {str(e)[:80]}" if col == '位置说明' else None
-            save_result_immediately(error_row, csv_shard, json_shard)
-            note(f"{tag} 行{idx + 1} 订单{order_id} → ✗ 异常: {str(e)[:60]}")
 
-            # V7.4：OOM 死循环自愈——连续 OOM 行达到阈值即销毁重建 OCR 引擎，
-            # 释放异常路径泄漏的活跃张量；否则该 worker 分片剩余行会全部报废。
             if 'GPU显存不足' in str(e):
+                # V7.5：OOM 行不落 ERROR 结果行——V7.4 落盘后断点续传把它当
+                # "已处理"永久跳过，补下载重试轮也不再碰它，失败被固化进最终
+                # 输出。保持未写入，由重启后的进程/补下载重试轮/下次重跑重试。
                 consecutive_oom_rows += 1
-                if consecutive_oom_rows >= OOM_REINIT_AFTER_CONSECUTIVE_ROWS:
+                note(f"{tag} 行{idx + 1} 订单{order_id} → ✗ GPU OOM"
+                     f"（不落盘，留待重试）: {str(e)[:60]}")
+                if consecutive_oom_rows >= OOM_EXIT_AFTER_CONSECUTIVE_ROWS:
+                    # V7.5：进程内销毁重建 predictor 救不了 C++ 侧泄漏的活跃
+                    # 张量（0806 实测：重建后小图能过、大图立刻再 OOM）。显存
+                    # 随进程终止由驱动整体回收才彻底——退出，主进程自动重启。
                     note(f"{tag} ⚠ 连续 {consecutive_oom_rows} 行 GPU OOM，"
-                         f"疑似显存泄漏死循环，销毁重建 OCR 引擎 …")
+                         f"退出进程等待主进程重启（显存随进程退出整体归还）…")
                     try:
-                        reinit_ocr_predictor()
-                        consecutive_oom_rows = 0
-                        note(f"{tag} ✓ OCR 引擎重建完成，继续处理")
-                    except Exception as rex:
-                        note(f"{tag} ✗ OCR 引擎重建失败: {type(rex).__name__}: "
-                             f"{str(rex)[:80]}；worker 退出，重跑脚本可续传")
-                        sys.exit(1)
+                        _dl_executor.shutdown(wait=False, cancel_futures=True)
+                    except Exception:
+                        pass
+                    sys.stdout.flush()
+                    sys.__stderr__.flush()
+                    # os._exit：跳过解释器退出时对下载线程的 join（可能拖几十秒
+                    # 甚至卡死导致主进程迟迟无法重启）；结果 csv/jsonl 逐行即写
+                    # 即关、日志行缓冲，无数据丢失风险。
+                    os._exit(WORKER_EXIT_OOM_RESPAWN)
             else:
+                error_row = row.to_dict()
+                for col in NEW_COLS:
+                    error_row[col] = f"ERROR: {str(e)[:80]}" if col == '位置说明' else None
+                save_result_immediately(error_row, csv_shard, json_shard)
+                note(f"{tag} 行{idx + 1} 订单{order_id} → ✗ 异常: {str(e)[:60]}")
                 consecutive_oom_rows = 0
+                row_written = True
 
-        with progress_lock:
-            progress_counter.value += 1
+        if row_written:
+            # V7.5：OOM 未落盘的行不计入进度——它们终将被重试，现在计数、重试
+            # 后再计数会让进度超过总数；worker_progress 每 worker 单写者递增，
+            # 是主进程判断"重启后是否有实际进展"的依据。
+            with progress_lock:
+                progress_counter.value += 1
+            if worker_progress is not None:
+                worker_progress[worker_id] += 1
 
         # V7.1：定期归还空闲显存，防止多进程 auto_growth 缓存挤兑（0803 事故根因）
         if (pi + 1) % GPU_CACHE_RELEASE_EVERY_ROWS == 0:
@@ -2612,57 +2664,102 @@ def _run_worker_round(pending_df: pd.DataFrame, total_rows: int, output_csv: str
 
     progress_counter = ctx.Value('i', 0)
     progress_lock    = ctx.Lock()
+    # V7.5：每 worker 已落盘行数（worker 内单写者递增，主进程只读），用于判断
+    # OOM 重启之间是否有实际进展——零进展的重启不解决问题，攒满 strikes 即放弃。
+    worker_progress  = ctx.Array('i', num_workers)
 
-    procs = []
-    for k in range(num_workers):
-        if len(shards[k]) == 0:
-            continue
+    def _spawn(k: int):
         p = ctx.Process(
             target=worker_main,
             args=(k, shards[k], total_rows, output_csv,
                   args.gpu_mem_fraction, args.download_workers, args.prefetch,
                   progress_counter, progress_lock, round_id, download_semaphore,
-                  ocr_semaphore, args.gpu_mem_limit_mb),
+                  ocr_semaphore, args.gpu_mem_limit_mb, worker_progress),
             name=f"ocr-worker-{k}" if round_id == 0 else f"ocr-retry{round_id}-worker-{k}",
         )
         p.start()
-        procs.append(p)
+        return p
 
-    print(f"已启动 {len(procs)} 个 worker 进程（{round_label}），正在处理 {n_pending} 行 …\n")
+    # V7.5：slots 取代一次性的 procs 列表——worker 因连续 OOM 主动退出
+    # （exitcode=WORKER_EXIT_OOM_RESPAWN）时自动重启，其余退出视为终态(settled)。
+    slots: dict[int, dict] = {}
+    for k in range(num_workers):
+        if len(shards[k]) == 0:
+            continue
+        slots[k] = {'proc': _spawn(k), 'settled': False, 'gave_up': False,
+                    'respawns': 0, 'strikes': 0, 'progress_mark': 0}
+
+    print(f"已启动 {len(slots)} 个 worker 进程（{round_label}），正在处理 {n_pending} 行 …\n")
 
     start_time = time.time()
+    total_respawns = 0
     while True:
-        alive = [p for p in procs if p.is_alive()]
+        for k, slot in slots.items():
+            p = slot['proc']
+            if slot['settled'] or p.is_alive():
+                continue
+            p.join()
+            if p.exitcode == WORKER_EXIT_OOM_RESPAWN:
+                # 自上次 OOM 重启以来有没有新落盘的行？有则清零 strikes。
+                made_progress = worker_progress[k] > slot['progress_mark']
+                slot['progress_mark'] = worker_progress[k]
+                slot['strikes'] = 0 if made_progress else slot['strikes'] + 1
+                if slot['strikes'] >= OOM_RESPAWN_MAX_STRIKES:
+                    slot['settled'] = True
+                    slot['gave_up'] = True
+                    print(f"\n⚠ [W{k}] 连续 {OOM_RESPAWN_MAX_STRIKES} 次重启之间零新增落盘行"
+                          f"（原地 OOM 无进展），放弃重启——多半是显存配置对这批大图"
+                          f"太紧（调大 --gpu-mem-limit-mb 或调小 --workers），"
+                          f"剩余行保留给下次续传", file=sys.__stderr__, flush=True)
+                else:
+                    slot['respawns'] += 1
+                    total_respawns += 1
+                    print(f"\n♻ [W{k}] 连续 GPU OOM 主动退出（显存已随进程整体归还），"
+                          f"自动重启（第 {slot['respawns']} 次）…",
+                          file=sys.__stderr__, flush=True)
+                    slot['proc'] = _spawn(k)
+            else:
+                slot['settled'] = True  # 0=正常完成；其它=真崩溃，不盲目重启
+
+        n_alive = sum(1 for s in slots.values() if s['proc'].is_alive())
         done  = progress_counter.value
         elapsed = time.time() - start_time
         rate    = done / elapsed if elapsed > 0 else 0
         eta_s   = (n_pending - done) / rate if rate > 0 else 0
+        respawn_note = f"(OOM重启{total_respawns}次)" if total_respawns else ""
         print(f"\r[{round_label}] 进度 {done}/{n_pending}  ({done / n_pending * 100:5.1f}%)  "
-              f"存活worker {len(alive)}/{len(procs)}  "
+              f"存活worker {n_alive}/{len(slots)}{respawn_note}  "
               f"速率 {rate:4.1f} 行/秒  已用 {elapsed / 60:5.1f}min  "
               f"预计剩余 {eta_s / 60:5.1f}min      ",
               end='', file=sys.__stderr__, flush=True)
-        if not alive:
+        if all(s['settled'] for s in slots.values()):
             break
         time.sleep(args.progress_interval)
 
     print(file=sys.__stderr__)  # 换行
-    for p in procs:
-        p.join()
+    for s in slots.values():
+        s['proc'].join()
 
     # 报告异常退出的 worker（分片可能未跑完 → 重跑本脚本即可续传）
-    dead = [p for p in procs if p.exitcode not in (0, None)]
-    if dead:
-        print(f"\n⚠ [{round_label}] 有 {len(dead)} 个 worker 非正常退出："
-              f"{[(p.name, p.exitcode) for p in dead]}")
+    failed = []
+    for k in sorted(slots):
+        s = slots[k]
+        if s['gave_up']:
+            failed.append((f"W{k}", f"连续{OOM_RESPAWN_MAX_STRIKES}次OOM重启无进展，已放弃"))
+        elif s['proc'].exitcode not in (0, None):
+            failed.append((f"W{k}", s['proc'].exitcode))
+    if failed:
+        print(f"\n⚠ [{round_label}] 有 {len(failed)} 个 worker 非正常退出：{failed}")
         print("  重新运行本脚本即可从分片断点续传未完成的行。")
+    if total_respawns:
+        print(f"[{round_label}] 本轮因连续 GPU OOM 自动重启 worker 共 {total_respawns} 次。")
 
     final_done = progress_counter.value
     total_elapsed = time.time() - start_time
     print(f"[{round_label}] 本轮处理 {final_done} 行，用时 {total_elapsed / 60:.1f}min "
           f"（平均 {final_done / total_elapsed if total_elapsed > 0 else 0:.1f} 行/秒）")
 
-    return not dead
+    return not failed
 
 
 def main():

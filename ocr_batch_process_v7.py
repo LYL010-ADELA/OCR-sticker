@@ -2366,13 +2366,41 @@ _NO_RESULT_DETAIL = ('ERROR: 未处理（worker 因显存不足被放弃或运�
                      '重跑本脚本可自动补上')
 
 
-def _row_fingerprint(frame: pd.DataFrame) -> pd.Series:
-    """行指纹 = 订单号 + 全部图片地址列，用于给缺少 SRC_ROW_COL 的旧分片结果
-    定位它属于哪一源行。订单号重复时（同一订单多商品）各行的出库图不同，
-    因此加上图片列即可区分；若连图片列都完全相同，那本就是完全重复的行，
-    归到哪一行内容都一样。"""
-    cols = ['订单号'] + [c for c in IMAGE_COLUMNS if c in frame.columns]
-    return frame[cols].astype(str).agg('\x01'.join, axis=1)
+def _fingerprint_cols(df: pd.DataFrame) -> list[str]:
+    """行指纹用的列集合，必须由**源表**决定（源表是权威）。"""
+    return ['订单号'] + [c for c in IMAGE_COLUMNS if c in df.columns]
+
+
+def _row_fingerprint(frame: pd.DataFrame, cols: list[str]) -> pd.Series:
+    """行指纹 = 订单号 + 全部图片地址列，用于给缺少 SRC_ROW_COL 的旧结果定位
+    它属于哪一源行。订单号重复时（同一订单多商品）各行的出库图不同，因此加上
+    图片列即可区分；若连图片列都完全相同，那本就是完全重复的行，归到哪一行
+    内容都一样。
+
+    cols 必须由调用方从源表算出（_fingerprint_cols）并对参与比对的所有表用
+    同一份：若按各表自身的列集合各算一次，某份 CSV 少一列就会导致所有指纹
+    全部对不上（表现为"整批重跑"或"全部记录无法归属"）。frame 里缺的列按
+    空值处理。
+
+    空值一律归一成空串，不能直接用 astype(str)：内存里的 None 会变成 'None'
+    而 CSV 往返后的 NaN 会变成 'nan'，同一行的指纹就对不上了。同理去掉数值
+    列往返产生的尾随 '.0'（float64 的 '123.0' vs int64/str 的 '123'）。指纹
+    只需在参与比对的各表之间自洽，不要求还原原值，所以这些归一是安全的。
+    """
+    parts = []
+    for c in cols:
+        if c in frame.columns:
+            s = frame[c]
+            s = s.astype(str).where(s.notna(), '')
+            parts.append(s.str.strip().str.replace(r'\.0$', '', regex=True))
+        else:
+            parts.append(pd.Series('', index=frame.index, dtype=object))
+    if not parts:
+        return pd.Series('', index=frame.index, dtype=object)
+    out = parts[0]
+    for p in parts[1:]:
+        out = out + '\x01' + p
+    return out
 
 
 def _resolve_src_positions(df: pd.DataFrame, merged: pd.DataFrame) -> list:
@@ -2382,13 +2410,14 @@ def _resolve_src_positions(df: pd.DataFrame, merged: pd.DataFrame) -> list:
     同指纹多源行时按出现顺序依次占位。
     """
     n = len(df)
+    fp_cols = _fingerprint_cols(df)
     fp_positions: dict[str, list[int]] = {}
-    for pos, fp in enumerate(_row_fingerprint(df)):
+    for pos, fp in enumerate(_row_fingerprint(df, fp_cols)):
         fp_positions.setdefault(fp, []).append(pos)
 
     key_vals = (pd.to_numeric(merged[SRC_ROW_COL], errors='coerce')
                 if SRC_ROW_COL in merged.columns else None)
-    merged_fp = _row_fingerprint(merged)
+    merged_fp = _row_fingerprint(merged, fp_cols)
     fp_cursor: dict[str, int] = {}
 
     positions = []
@@ -2491,8 +2520,9 @@ def _read_processed_rows(df: pd.DataFrame, output_csv: str) -> tuple[set[int], s
     processed_pos: dict[int, bool] = {}
     processed_oid: dict[str, bool] = {}
 
+    fp_cols = _fingerprint_cols(df)
     fp_positions: dict[str, list[int]] = {}
-    for pos_i, fp in enumerate(_row_fingerprint(df)):
+    for pos_i, fp in enumerate(_row_fingerprint(df, fp_cols)):
         fp_positions.setdefault(fp, []).append(pos_i)
 
     for dfx in _collect_shard_frames(output_csv):
@@ -2501,7 +2531,7 @@ def _read_processed_rows(df: pd.DataFrame, output_csv: str) -> tuple[set[int], s
         has_key = SRC_ROW_COL in dfx.columns
         # 行指纹按帧独立计游标：同一记录同时出现在合并 CSV 和分片里时，两次都应
         # 落到同一源行；若跨帧共用游标会被错当成两个不同的行而虚增"已处理"。
-        frame_fps = None if has_key else _row_fingerprint(dfx)
+        frame_fps = None if has_key else _row_fingerprint(dfx, fp_cols)
         fp_cursor: dict[str, int] = {}
         try:
             for i, (_, r) in enumerate(dfx.iterrows()):
@@ -2610,11 +2640,13 @@ def worker_main(worker_id: int,
             elif '订单号' in dfx.columns:
                 # 旧分片：用行指纹回推本分片内的源行，避免把同订单的兄弟行
                 # 一起当成已处理而跳过（与 _read_processed_rows 同一套判定）。
+                fp_cols = _fingerprint_cols(df_shard)
                 shard_fp = {}
-                for pos_i, fp in zip(df_shard.index, _row_fingerprint(df_shard)):
+                for pos_i, fp in zip(df_shard.index,
+                                     _row_fingerprint(df_shard, fp_cols)):
                     shard_fp.setdefault(fp, []).append(pos_i)
                 cursor: dict[str, int] = {}
-                for fp in _row_fingerprint(dfx):
+                for fp in _row_fingerprint(dfx, fp_cols):
                     plist = shard_fp.get(fp)
                     if not plist:
                         continue        # 指纹对不上本分片任何行：视为未处理，重跑

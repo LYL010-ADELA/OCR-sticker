@@ -101,10 +101,28 @@ V7.5（2026-08-06）：OOM 自愈从"进程内重建引擎"升级为"worker 退�
      当"已处理"永久跳过，自动补下载重试轮也不会再碰它（current_ids 只含本次
      pending 行）——失败被永久固化进最终输出。现在 OOM 行保持未写入，由
      重启后的进程 / 本轮补下载重试轮 / 下次重跑自然重试。
-  3. 历史污染兜底：_read_processed_orders 把遗留的 "ERROR:" 行视为未处理
+  3. 历史污染兜底：_read_processed_rows 把遗留的 "ERROR:" 行视为未处理
      （重跑自动重试）；_merge_frames 保证同一订单的正常结果行永远优先于
      ERROR 行（不管落在哪个分片/轮次）。配套 purge_oom_error_rows.py 可把
      已污染分片里的 OOM ERROR 行一次性物理清除。
+
+V7.6（2026-08-12）：行完整性根治——输出行数必须等于源表行数，一行都不能少
+  0808 批次核对发现两条独立的静默丢行路径，合计丢了 981 行（源表 27756 →
+  输出 26775），而且历史每一批都在丢：
+  1. 按订单号去重 collapse 掉同订单多行（约 970 行）：订单号在源表里可能重复
+     ——同一订单含多个商品/多个 LOB 时各占一行、各有各的出库图。
+     _merge_frames 的 drop_duplicates(subset='订单号') 把它们合并成一行。
+     修复：结果行携带源行号(SRC_ROW_COL)作为稳定行身份，按它去重；旧分片没有
+     该列时用"订单号+全部图片地址列"的行指纹回推源行，仍可完整恢复。
+  2. 被放弃 worker 的 OOM 行整行消失（11 行）：V7.5 让 OOM 行不落盘以便重试，
+     但 worker 被放弃时这些行就再没人写 → 最终输出里整行不存在（连订单号
+     都没有），比留个 ERROR 行更危险。
+     修复：_merge_frames 改为以源表为基准左连接回填——每一源行恰好输出一行，
+     没有结果的行保留原始列并把 位置说明 标记为 ERROR，数值列留空（留空而非
+     填 0，避免被下游误读成"确认无封口贴"）。
+  3. merge_shards 增加行数硬校验：输出行数 != 源表行数就拒绝写出并保留分片，
+     丢行不可能再静默发生。
+  4. 断点续传同步改为按源行号判定，订单号重复时不会误跳过兄弟行。
 
 以下为 V5 说明（Watch/AirPods 锚点增强，V6/V7 未改动核心检测）：
 
@@ -2210,6 +2228,13 @@ def _print_summary(r: dict):
 # 十、主流程
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# V7.6：结果行携带的"源行号"列（仅存在于 worker 分片文件中，最终输出会剔除）。
+# 订单号在源表里可能重复——同一订单含多个商品/多个 LOB 时各占一行、各有各的
+# 出库图。V7.5 及以前按订单号去重合并，会把这些行 collapse 成一行而静默丢数据
+# （0808 批次：源表 27756 行 → 输出 26775 行，约 970 行是这样消失的）。
+# 源行号是稳定的行身份，用于合并去重、断点续传，以及保证输出与源表行数一致。
+SRC_ROW_COL = '__源行号__'
+
 NEW_COLS = [
     '识别LOB',             # 核心: iPhone/Watch/AirPods/iPad/Mac；其它非空值=配件(原样保留, 如 Beats/原厂配件/3PP)
     '是否规范粘贴',        # 0=不合规 | 1=合规
@@ -2236,9 +2261,14 @@ NEW_COLS = [
 ]
 
 
-def _result_to_row(row, r: dict) -> dict:
-    """把 process_row 的返回值 r 合并进原始行 → 输出行字典。"""
+def _result_to_row(row, r: dict, src_row: int | None = None) -> dict:
+    """把 process_row 的返回值 r 合并进原始行 → 输出行字典。
+
+    V7.6：src_row 为源表行号，写入 SRC_ROW_COL 作为稳定行身份（见该常量注释）。
+    """
     result_row = row.to_dict()
+    if src_row is not None:
+        result_row[SRC_ROW_COL] = int(src_row)
     result_row['识别LOB']            = r.get('lob', '')
     result_row['是否规范粘贴']       = r['is_compliant']
     result_row['封口贴存在']         = r['seal_exists']
@@ -2309,7 +2339,7 @@ def _iter_shard_csvs(output_csv: str) -> list[str]:
 
 def _collect_shard_frames(output_csv: str) -> list[pd.DataFrame]:
     """读取合并 CSV(若存在) + 全部分片 csv（主批次 + 各补下载重试轮），
-    按"更晚处理的结果更权威"的顺序返回，供 merge_shards / _read_processed_orders /
+    按"更晚处理的结果更权威"的顺序返回，供 merge_shards / _read_processed_rows /
     _orders_missing_seal 复用。
 
     兼容 V3：合并 CSV(output_csv) 可能是一份跑到一半的 V3 单文件结果，或
@@ -2332,26 +2362,100 @@ def _collect_shard_frames(output_csv: str) -> list[pd.DataFrame]:
     return frames
 
 
+_NO_RESULT_DETAIL = ('ERROR: 未处理（worker 因显存不足被放弃或运行中断），'
+                     '重跑本脚本可自动补上')
+
+
+def _row_fingerprint(frame: pd.DataFrame) -> pd.Series:
+    """行指纹 = 订单号 + 全部图片地址列，用于给缺少 SRC_ROW_COL 的旧分片结果
+    定位它属于哪一源行。订单号重复时（同一订单多商品）各行的出库图不同，
+    因此加上图片列即可区分；若连图片列都完全相同，那本就是完全重复的行，
+    归到哪一行内容都一样。"""
+    cols = ['订单号'] + [c for c in IMAGE_COLUMNS if c in frame.columns]
+    return frame[cols].astype(str).agg('\x01'.join, axis=1)
+
+
+def _resolve_src_positions(df: pd.DataFrame, merged: pd.DataFrame) -> list:
+    """给每条结果记录解析出它对应的源行位置（0..len(df)-1），无法归属的记为 None。
+
+    新分片直接读 SRC_ROW_COL；旧分片（V7.5 及以前，没有该列）退回行指纹匹配，
+    同指纹多源行时按出现顺序依次占位。
+    """
+    n = len(df)
+    fp_positions: dict[str, list[int]] = {}
+    for pos, fp in enumerate(_row_fingerprint(df)):
+        fp_positions.setdefault(fp, []).append(pos)
+
+    key_vals = (pd.to_numeric(merged[SRC_ROW_COL], errors='coerce')
+                if SRC_ROW_COL in merged.columns else None)
+    merged_fp = _row_fingerprint(merged)
+    fp_cursor: dict[str, int] = {}
+
+    positions = []
+    for i in range(len(merged)):
+        pos = None
+        if key_vals is not None:
+            kv = key_vals.iat[i]
+            if pd.notna(kv) and 0 <= int(kv) < n:
+                pos = int(kv)
+        if pos is None:
+            plist = fp_positions.get(merged_fp.iat[i])
+            if plist:
+                c = fp_cursor.get(merged_fp.iat[i], 0)
+                pos = plist[c % len(plist)]
+                fp_cursor[merged_fp.iat[i]] = c + 1
+        positions.append(pos)
+    return positions
+
+
 def _merge_frames(df: pd.DataFrame, frames: list[pd.DataFrame]) -> pd.DataFrame | None:
-    """把多份分片结果合并去重（同订单号保留最后一次结果），按源文件原始行序排序。"""
+    """合并所有分片结果 → 与源表行数严格一致、行序一致的结果表。
+
+    V7.6：行身份从"订单号"改为源行号（见 SRC_ROW_COL）。此前按订单号去重会把
+    同一订单的多个商品行 collapse 成一行而静默丢数据；且被放弃 worker 的 OOM 行
+    未落盘时会整行从输出里消失。现在以源表为基准左连接回填——每一源行恰好输出
+    一行，没有结果的行标记为 ERROR 待重跑，绝不静默消失。
+    """
     if not frames:
         return None
     merged = pd.concat(frames, ignore_index=True)
-    if '订单号' in merged.columns:
-        if '位置说明' in merged.columns:
-            # V7.5：同一订单同时存在 ERROR 行与正常结果行时（重跑修复后，旧的
-            # ERROR 行可能残留在排序更靠后的分片文件里），保证正常结果获胜：
-            # 把 ERROR 行稳定地挪到最前，keep='last' 自然选中最后一条正常结果；
-            # 只剩 ERROR 行的订单仍保留其最后一条 ERROR。
-            is_err = merged['位置说明'].astype(str).str.startswith('ERROR:')
-            merged = pd.concat([merged[is_err], merged[~is_err]], ignore_index=True)
-        merged = merged.drop_duplicates(subset='订单号', keep='last')
-        order_to_pos = {str(oid): i for i, oid in enumerate(df['订单号'].astype(str))}
-        merged['__pos__'] = merged['订单号'].astype(str).map(
-            lambda o: order_to_pos.get(o, len(order_to_pos))
-        )
-        merged = merged.sort_values('__pos__', kind='stable').drop(columns='__pos__')
-    return merged
+    if '订单号' not in merged.columns:
+        return merged
+
+    if '位置说明' in merged.columns:
+        # V7.5：同一行同时存在 ERROR 行与正常结果行时（重跑修复后，旧的 ERROR
+        # 行可能残留在排序更靠后的分片文件里），保证正常结果获胜：把 ERROR 行
+        # 稳定地挪到最前，keep='last' 自然选中最后一条正常结果；只剩 ERROR 行
+        # 的源行仍保留其最后一条 ERROR。
+        is_err = merged['位置说明'].astype(str).str.startswith('ERROR:')
+        merged = pd.concat([merged[is_err], merged[~is_err]], ignore_index=True)
+
+    merged['__pos__'] = _resolve_src_positions(df, merged)
+    n_orphan = int(merged['__pos__'].isna().sum())
+    if n_orphan:
+        # 归属不到任何源行：多为换了源文件却复用了同名结果/分片文件的残留。
+        print(f"  ⚠ {n_orphan} 条结果记录无法归属到本源表的任何一行（已忽略）——"
+              f"通常是换了 --input 却复用了同名输出/分片文件的残留。")
+        merged = merged[merged['__pos__'].notna()]
+    merged = merged.drop_duplicates(subset='__pos__', keep='last')
+
+    # 以源表为基准：源列取源表自身的值（权威、且避免 CSV 往返的类型漂移），
+    # 结果列按源行号左连接回填。
+    res_cols = [c for c in NEW_COLS if c in merged.columns]
+    joined = merged.set_index('__pos__')[res_cols].reindex(range(len(df)))
+    out = df.copy()
+    for col in NEW_COLS:
+        out[col] = joined[col].to_numpy() if col in res_cols else None
+
+    has_result = pd.Series(False, index=range(len(df)))
+    has_result.loc[merged['__pos__'].astype(int).tolist()] = True
+    n_missing = int((~has_result).sum())
+    if n_missing:
+        # 数值列保持为空而不是填 0——填 0 会被下游误读成"确认无封口贴"。
+        out.loc[(~has_result).to_numpy(), '位置说明'] = _NO_RESULT_DETAIL
+        print(f"  ⚠ 有 {n_missing} 行没有任何识别结果，已在输出中保留原行并标记 "
+              f"ERROR（数值列留空，不会被误读成'无封口贴'）；重跑本脚本自动补上。")
+    return out
 
 
 def _orders_missing_seal(merged: pd.DataFrame | None, order_ids) -> list[str]:
@@ -2372,22 +2476,33 @@ def _orders_missing_seal(merged: pd.DataFrame | None, order_ids) -> list[str]:
     return sorted(missing)
 
 
-def _read_processed_orders(output_csv: str) -> set[str]:
-    """收集所有已处理的订单号，用于断点续传。
+def _read_processed_rows(output_csv: str) -> tuple[set[int], set[str]]:
+    """收集已处理的行，用于断点续传，返回 (已处理源行号集合, 已处理订单号集合)。
 
     会扫描合并 CSV(output_csv) + 全部分片 csv（含各补下载重试轮，见
-    _iter_shard_csvs），取并集。兼容 V3：V3 是单文件追加输出，所以一份跑到
-    一半的 V3 结果 CSV 会被直接识别为"已处理"，无缝续跑。
+    _iter_shard_csvs），取并集。
+
+    V7.6：新分片带 SRC_ROW_COL，按源行号判定（订单号重复时不会误跳过兄弟行）；
+    旧分片没有该列，退回订单号判定（同订单多行会被一起跳过，是旧数据的固有
+    局限——想彻底补齐这些行请删掉旧分片重跑该批）。兼容 V3 单文件输出同理。
     """
-    processed_state: dict[str, bool] = {}
+    processed_pos: dict[int, bool] = {}
+    processed_oid: dict[str, bool] = {}
     for dfx in _collect_shard_frames(output_csv):
         if '订单号' not in dfx.columns:
             continue
+        has_key = SRC_ROW_COL in dfx.columns
         try:
             for _, r in dfx.iterrows():
                 oid = str(r.get('订单号', '')).strip()
                 if not oid:
                     continue
+                pos = None
+                if has_key:
+                    try:
+                        pos = int(float(r.get(SRC_ROW_COL)))
+                    except (TypeError, ValueError):
+                        pos = None
                 download_status = str(r.get('图片下载状态', '')).strip()
                 detail = str(r.get('位置说明', '')).strip()
                 position_valid = str(r.get('贴纸位置规范', '')).strip()
@@ -2396,18 +2511,21 @@ def _read_processed_orders(output_csv: str) -> set[str]:
                     or detail.startswith('图片下载不完整')
                     or position_valid in {'-2', '-2.0'}
                 )
+                target = processed_pos if pos is not None else processed_oid
+                key = pos if pos is not None else oid
                 if detail.startswith('ERROR:'):
                     # V7.5：ERROR 行（含 V7.4 落盘的 "ERROR: GPU显存不足…"）不算
-                    # 已处理——否则失败被永久固化进最终输出；但也不推翻同订单已有
+                    # 已处理——否则失败被永久固化进最终输出；但也不推翻同一行已有
                     # 的正常结果，与 _merge_frames 的"正常结果永远优先于 ERROR 行"
-                    # 保持一致，避免已修复的订单被无谓重跑。
-                    processed_state.setdefault(oid, False)
+                    # 保持一致，避免已修复的行被无谓重跑。
+                    target.setdefault(key, False)
                 else:
-                    # 与 merge_shards 的 keep='last' 一致：后读到的同订单结果覆盖前面的状态。
-                    processed_state[oid] = not needs_rerun
+                    # 与 _merge_frames 的 keep='last' 一致：后读到的结果覆盖前面的状态。
+                    target[key] = not needs_rerun
         except Exception as e:
             print(f"  ⚠ 解析分片内容失败（忽略，相关行将重跑）: {e}")
-    return {oid for oid, is_done in processed_state.items() if is_done}
+    return ({p for p, done in processed_pos.items() if done},
+            {o for o, done in processed_oid.items() if done})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2458,20 +2576,25 @@ def worker_main(worker_id: int,
         traceback.print_exc()
         sys.exit(1)
 
-    # 分片内断点续传：跳过本分片已写过的订单号（重跑同一分片时生效）
-    shard_done: set[str] = set()
+    # 分片内断点续传：跳过本分片已写过的行（重跑同一分片、OOM 重启后生效）
+    # V7.6：优先按源行号判定；旧分片没有该列时退回订单号。
+    done_pos: set[int] = set()
+    done_oids: set[str] = set()
     if os.path.exists(csv_shard):
         try:
             dfx = pd.read_csv(csv_shard, encoding='utf-8-sig', dtype=_ID_DTYPE,
                               on_bad_lines='skip')
-            if '订单号' in dfx.columns:
-                shard_done = set(dfx['订单号'].astype(str))
+            if SRC_ROW_COL in dfx.columns:
+                done_pos = {int(v) for v in
+                            pd.to_numeric(dfx[SRC_ROW_COL], errors='coerce').dropna()}
+            elif '订单号' in dfx.columns:
+                done_oids = set(dfx['订单号'].astype(str))
         except Exception:
             pass
 
     # df_shard 的原始 index 即源文件行号（主进程 reset_index 后 iloc 切片保留）
     rows = [(idx, row) for idx, row in df_shard.iterrows()
-            if str(row.get('订单号', '')) not in shard_done]
+            if idx not in done_pos and str(row.get('订单号', '')) not in done_oids]
 
     # 行级预取下载（与 V3 主循环一致，只是作用于本 worker 的分片）
     prefetch_cache: dict[int, list] = {}
@@ -2495,7 +2618,7 @@ def worker_main(worker_id: int,
         row_written = False
         try:
             r = process_row(row, idx + 1, total_rows, prefetched_tasks=tasks)
-            result_row = _result_to_row(row, r)
+            result_row = _result_to_row(row, r, src_row=idx)
             save_result_immediately(result_row, csv_shard, json_shard)
             consecutive_oom_rows = 0
             row_written = True
@@ -2529,6 +2652,7 @@ def worker_main(worker_id: int,
                     os._exit(WORKER_EXIT_OOM_RESPAWN)
             else:
                 error_row = row.to_dict()
+                error_row[SRC_ROW_COL] = int(idx)
                 for col in NEW_COLS:
                     error_row[col] = f"ERROR: {str(e)[:80]}" if col == '位置说明' else None
                 save_result_immediately(error_row, csv_shard, json_shard)
@@ -2564,8 +2688,20 @@ def merge_shards(df: pd.DataFrame, output_csv: str, output_excel: str) -> bool:
         return False
 
     merged = _merge_frames(df, frames)
+
+    # V7.6：行完整性硬校验——输出行数必须等于源表有效行数。丢行是过去两次事故
+    # 的共同表现（按订单号去重 collapse 掉同订单多商品行、被放弃 worker 的 OOM
+    # 行未落盘），绝不允许再静默发生。
+    if len(merged) != len(df):
+        print(f"  ✗ 行数不一致：源表 {len(df)} 行，合并结果 {len(merged)} 行。"
+              f"已保留分片文件，请勿使用本次输出，并把该信息反馈排查。")
+        return False
+    n_err = int(merged['位置说明'].astype(str).str.startswith('ERROR:').sum())
+
     merged.to_csv(output_csv, index=False, encoding='utf-8-sig')
-    print(f"✓ 合并完成，最终 CSV: {output_csv}（{len(merged)} 行）")
+    print(f"✓ 合并完成，最终 CSV: {output_csv}（{len(merged)} 行，与源表一致）")
+    if n_err:
+        print(f"  ⚠ 其中 {n_err} 行为 ERROR（未成功识别），重跑本脚本会自动重试这些行。")
 
     print(f"正在生成 Excel: {output_excel}")
     with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
@@ -2799,12 +2935,15 @@ def main():
     total_rows = len(df)
     print(f"总共 {total_rows} 行数据")
 
-    # 断点续传：扫描已有分片，跳过已处理订单号
-    processed_orders = _read_processed_orders(output_csv)
-    if processed_orders:
-        print(f"发现已有分片结果，已处理 {len(processed_orders)} 行，仅处理剩余行…")
+    # 断点续传：扫描已有分片，跳过已处理的行
+    processed_pos, processed_oids = _read_processed_rows(output_csv)
+    n_processed = len(processed_pos) + len(processed_oids)
+    if n_processed:
+        print(f"发现已有分片结果，已处理 {n_processed} 行，仅处理剩余行…")
 
-    pending_mask = ~df['订单号'].astype(str).str.strip().isin(processed_orders)
+    # V7.6：源行号（新分片）与订单号（旧分片回退）两条判定取"都不认为已处理"
+    pending_mask = (~df.index.isin(processed_pos)) & (
+        ~df['订单号'].astype(str).str.strip().isin(processed_oids))
     # df 已 reset_index → 其 index 即源文件行号；筛选后保留该行号（供日志 & 排序）
     pending_df = df[pending_mask]
     n_pending  = len(pending_df)

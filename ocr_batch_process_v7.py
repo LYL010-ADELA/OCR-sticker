@@ -2476,24 +2476,35 @@ def _orders_missing_seal(merged: pd.DataFrame | None, order_ids) -> list[str]:
     return sorted(missing)
 
 
-def _read_processed_rows(output_csv: str) -> tuple[set[int], set[str]]:
+def _read_processed_rows(df: pd.DataFrame, output_csv: str) -> tuple[set[int], set[str]]:
     """收集已处理的行，用于断点续传，返回 (已处理源行号集合, 已处理订单号集合)。
 
     会扫描合并 CSV(output_csv) + 全部分片 csv（含各补下载重试轮，见
     _iter_shard_csvs），取并集。
 
-    V7.6：新分片带 SRC_ROW_COL，按源行号判定（订单号重复时不会误跳过兄弟行）；
-    旧分片没有该列，退回订单号判定（同订单多行会被一起跳过，是旧数据的固有
-    局限——想彻底补齐这些行请删掉旧分片重跑该批）。兼容 V3 单文件输出同理。
+    V7.6：新分片带 SRC_ROW_COL，按源行号判定；旧分片（V7.5 及以前，含合并 CSV
+    本身——最终输出不含该列）用"订单号+全部图片地址列"的行指纹回推源行，精度
+    与源行号等同，因此订单号重复时不会误把兄弟行当成已处理而跳过。
+    只有连行指纹都对不上的记录才退回订单号判定（换过源文件的残留等）。
+    兼容 V3 单文件输出同理。
     """
     processed_pos: dict[int, bool] = {}
     processed_oid: dict[str, bool] = {}
+
+    fp_positions: dict[str, list[int]] = {}
+    for pos_i, fp in enumerate(_row_fingerprint(df)):
+        fp_positions.setdefault(fp, []).append(pos_i)
+
     for dfx in _collect_shard_frames(output_csv):
         if '订单号' not in dfx.columns:
             continue
         has_key = SRC_ROW_COL in dfx.columns
+        # 行指纹按帧独立计游标：同一记录同时出现在合并 CSV 和分片里时，两次都应
+        # 落到同一源行；若跨帧共用游标会被错当成两个不同的行而虚增"已处理"。
+        frame_fps = None if has_key else _row_fingerprint(dfx)
+        fp_cursor: dict[str, int] = {}
         try:
-            for _, r in dfx.iterrows():
+            for i, (_, r) in enumerate(dfx.iterrows()):
                 oid = str(r.get('订单号', '')).strip()
                 if not oid:
                     continue
@@ -2503,6 +2514,15 @@ def _read_processed_rows(output_csv: str) -> tuple[set[int], set[str]]:
                         pos = int(float(r.get(SRC_ROW_COL)))
                     except (TypeError, ValueError):
                         pos = None
+                    if pos is not None and not (0 <= pos < len(df)):
+                        pos = None
+                if pos is None and frame_fps is not None:
+                    fp = frame_fps.iat[i]
+                    plist = fp_positions.get(fp)
+                    if plist:
+                        c = fp_cursor.get(fp, 0)
+                        pos = plist[c % len(plist)]
+                        fp_cursor[fp] = c + 1
                 download_status = str(r.get('图片下载状态', '')).strip()
                 detail = str(r.get('位置说明', '')).strip()
                 position_valid = str(r.get('贴纸位置规范', '')).strip()
@@ -2588,7 +2608,19 @@ def worker_main(worker_id: int,
                 done_pos = {int(v) for v in
                             pd.to_numeric(dfx[SRC_ROW_COL], errors='coerce').dropna()}
             elif '订单号' in dfx.columns:
-                done_oids = set(dfx['订单号'].astype(str))
+                # 旧分片：用行指纹回推本分片内的源行，避免把同订单的兄弟行
+                # 一起当成已处理而跳过（与 _read_processed_rows 同一套判定）。
+                shard_fp = {}
+                for pos_i, fp in zip(df_shard.index, _row_fingerprint(df_shard)):
+                    shard_fp.setdefault(fp, []).append(pos_i)
+                cursor: dict[str, int] = {}
+                for fp in _row_fingerprint(dfx):
+                    plist = shard_fp.get(fp)
+                    if not plist:
+                        continue        # 指纹对不上本分片任何行：视为未处理，重跑
+                    c = cursor.get(fp, 0)
+                    done_pos.add(plist[c % len(plist)])
+                    cursor[fp] = c + 1
         except Exception:
             pass
 
@@ -2936,7 +2968,7 @@ def main():
     print(f"总共 {total_rows} 行数据")
 
     # 断点续传：扫描已有分片，跳过已处理的行
-    processed_pos, processed_oids = _read_processed_rows(output_csv)
+    processed_pos, processed_oids = _read_processed_rows(df, output_csv)
     n_processed = len(processed_pos) + len(processed_oids)
     if n_processed:
         print(f"发现已有分片结果，已处理 {n_processed} 行，仅处理剩余行…")

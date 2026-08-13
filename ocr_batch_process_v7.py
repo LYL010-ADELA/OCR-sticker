@@ -138,7 +138,13 @@ V7.7（2026-08-13）：Mac 召回改进——紫贴局部 OCR 对 Mac 开放 + �
   2. 紫贴 crop 送 OCR 前放大到长边 SCAN_CROP_UPSCALE_TO=2000。此前"局部放大
      OCR"名不副实：resize_for_ocr 只会缩小、从不放大，小 crop 原样进 OCR，
      字还是那么小。补上后实测救回 35% → 45%。放大后 crop 最多 4M 像素，
-     比整图最坏的 9M 还省显存，不引入新 OOM 风险；Watch/AirPods/配件同样受益。
+     比整图最坏的 9M 还省显存，不引入新 OOM 风险。
+     V7.7.2：放大只对 SCAN_CROP_UPSCALE_LOBS（缺省仅 Mac）生效。放大是为
+     "盒大、拍得远、贴纸占像素少"准备的；Watch 1.1%、AirPods 4.4% 的漏检率
+     本就很低（盒小、距离近、贴纸相对够大），而它们和配件恰是紫贴路径的调用
+     大头（配件还带 3 个旋转角度），一律放大等于把 6 倍像素开销花在没有收益
+     的地方。限定 Mac 后新增算力压在全批 1.4% 的行上。--scan-crop-upscale-lobs
+     可调整，实测某 LOB 有收益再加。
   3. 放大后必须把 OCR 返回的 poly 按放大倍数除回原 crop 尺度再偏移到整图
      坐标，否则贴纸位置系统性外扩 → rel_x/rel_y 越界 → 位置校验误判。
   验证工具见 diagnose_lob_recall.py（在真实漏检行上量测各路径召回）。
@@ -308,10 +314,18 @@ SCAN_LOCAL_CROP_MAX_CANDIDATES = 5
 
 # V7.7：紫贴局部 crop 送入 OCR 前放大到的长边。
 # 此前 "局部放大 OCR" 名不副实——resize_for_ocr 只会缩小、从不放大，小 crop 原样
-# 进 OCR，字还是那么小，白付了一次推理。补上放大后实测召回 35% → 45%。
+# 进 OCR，字还是那么小，白付了一次推理。补上放大后 Mac 实测召回 35% → 45%。
 # 2000 的另一个好处：放大后的 crop 最多 2000×2000=4M 像素，比整图最坏情况
 # 3000×3000=9M 还省显存，不会引入新的 OOM 风险。
 SCAN_CROP_UPSCALE_TO = 2000
+
+# V7.7.2：只对这些 LOB 放大。放大是为"盒大、拍得远、贴纸占像素少"准备的，
+# 只有 Mac 属于这种情况（无贴率 35-36%）。Watch 1.1%、AirPods 4.4% 的漏检率
+# 本就很低——盒子小、拍摄距离近，贴纸在画面里相对够大，不放大也能读到，
+# 再放大只是白付算力；而它们和配件恰恰是紫贴路径的调用大头（配件还带
+# 3 个旋转角度），把放大限制在 Mac 可以把新增开销压在全批 1.4% 的行上。
+# 逗号分隔的 --scan-crop-upscale-lobs 可调整；实测某 LOB 有收益再加进来。
+SCAN_CROP_UPSCALE_LOBS = {"Mac"}
 
 # 官方封口贴紫色条带 HSV 范围（OpenCV H: 0-179）。这里只作为局部 OCR 候选，
 # 不直接判定有贴，因此阈值宁可略宽。
@@ -900,15 +914,23 @@ def ocr_scan_candidate_crops(image: Image.Image,
                              base_texts: list[str],
                              base_polys: list,
                              image_id: str,
-                             max_candidates: int | None = None):
-    """对紫色候选 crop 做 OCR，命中扫码锚点时把 crop OCR 结果映射回整图坐标。"""
+                             max_candidates: int | None = None,
+                             lob: str | None = None):
+    """对紫色候选 crop 做 OCR，命中扫码锚点时把 crop OCR 结果映射回整图坐标。
+
+    V7.7.2：是否放大 crop 由 lob 决定（见 SCAN_CROP_UPSCALE_LOBS）——只有盒大、
+    拍得远、贴纸占像素少的 LOB 才需要放大；Watch/AirPods/配件盒小距离近，
+    不放大也能读到，放大只是白付算力。lob=None 时不放大（保守）。
+    """
     boxes = find_purple_scan_candidate_boxes(image, max_candidates=max_candidates)
     if not boxes:
         return None
 
+    upscale_to = SCAN_CROP_UPSCALE_TO if lob in SCAN_CROP_UPSCALE_LOBS else 0
+
     for ci, (x1, y1, x2, y2) in enumerate(boxes, 1):
         crop = image.crop((x1, y1, x2, y2))
-        crop_in, up_scale = upscale_crop_for_ocr(crop)
+        crop_in, up_scale = upscale_crop_for_ocr(crop, upscale_to)
         full_text, texts, polys, orig_h, orig_w = ocr_image_full(
             crop_in, f"{image_id}_purple{ci}")
         if has_scan_text(texts):
@@ -1846,7 +1868,7 @@ def find_back_image_by_scan_anchor(image: Image.Image, lob: str, image_id: str) 
         }
 
     if lob in SCAN_LOCAL_CROP_LOBS or is_accessory_lob(lob):
-        crop_hit = ocr_scan_candidate_crops(image, texts, polys_orig, image_id)
+        crop_hit = ocr_scan_candidate_crops(image, texts, polys_orig, image_id, lob=lob)
         if crop_hit is not None:
             cand_count = int(crop_hit.get("candidate_count", 0))
             crop_box = crop_hit.get("crop_box")
@@ -1882,7 +1904,7 @@ def _rotated_crop_scan(image: Image.Image, lob: str, image_id: str) -> dict | No
             continue
         scan_image = rotate_image_for_scan_ocr(image, angle)
         angle_id = f"{image_id}_rot{angle}"
-        crop_hit = ocr_scan_candidate_crops(scan_image, [], [], angle_id)
+        crop_hit = ocr_scan_candidate_crops(scan_image, [], [], angle_id, lob=lob)
         if crop_hit is None:
             continue
         cand_count = int(crop_hit.get("candidate_count", 0))
@@ -2670,7 +2692,8 @@ def worker_main(worker_id: int,
                 gpu_mem_limit_mb: int = 0,
                 worker_progress=None,
                 scan_crop_upscale: int | None = None,
-                scan_crop_candidates: int | None = None):
+                scan_crop_candidates: int | None = None,
+                scan_crop_upscale_lobs: set | None = None):
     """单个 worker 进程：初始化自己的 PaddleOCR，串行处理分到的行（内部预取下载），
     结果写入自己的分片文件。逐行详细日志重定向到分片 .log 文件，保持终端整洁。
 
@@ -2685,11 +2708,13 @@ def worker_main(worker_id: int,
     全局——CUDA 要求 spawn 启动方式，子进程是重新 import 本模块的，主进程解析
     到的 args 不会自动出现在这里。
     """
-    global SCAN_CROP_UPSCALE_TO, SCAN_LOCAL_CROP_MAX_CANDIDATES
+    global SCAN_CROP_UPSCALE_TO, SCAN_LOCAL_CROP_MAX_CANDIDATES, SCAN_CROP_UPSCALE_LOBS
     if scan_crop_upscale is not None:
         SCAN_CROP_UPSCALE_TO = scan_crop_upscale
     if scan_crop_candidates is not None:
         SCAN_LOCAL_CROP_MAX_CANDIDATES = scan_crop_candidates
+    if scan_crop_upscale_lobs is not None:
+        SCAN_CROP_UPSCALE_LOBS = set(scan_crop_upscale_lobs)
     csv_shard, json_shard, log_shard = _shard_paths(output_csv, worker_id, round_id)
     tag = f"[W{worker_id}]" if not round_id else f"[W{worker_id}][重试轮{round_id}]"
 
@@ -2919,6 +2944,12 @@ def parse_args():
                         f'{SCAN_CROP_UPSCALE_TO}；0=关闭放大，退回 V7.6 行为）。'
                         '放大是 Mac 召回从 35%% 提到 45%% 的关键，但会增加 crop '
                         'OCR 的像素量；嫌慢可降到 1400 左右先试')
+    p.add_argument('--scan-crop-upscale-lobs',
+                   default=','.join(sorted(SCAN_CROP_UPSCALE_LOBS)),
+                   help=f'只对这些 LOB 放大 crop，逗号分隔（缺省 '
+                        f'{",".join(sorted(SCAN_CROP_UPSCALE_LOBS))}；空字符串=都不放大）。'
+                        '放大是为"盒大、拍得远、贴纸占像素少"准备的，Watch/AirPods/'
+                        '配件盒小距离近不需要，放大只是白付算力')
     p.add_argument('--scan-crop-candidates', type=int,
                    default=SCAN_LOCAL_CROP_MAX_CANDIDATES,
                    help=f'每张图最多做几个紫贴候选的局部 OCR（缺省 '
@@ -2930,6 +2961,9 @@ def parse_args():
                         '（缺省 1；设为 0 关闭，等价于 V6 行为，需手动重跑整个脚本）')
     args = p.parse_args()
     args.input = args.input or args.input_file
+    args.scan_crop_upscale_lobs = {s.strip() for s in
+                                   str(args.scan_crop_upscale_lobs or '').split(',')
+                                   if s.strip()}
     if not args.input:
         p.error(
             '请提供输入 Excel 路径，例如：python ocr_batch_process_v7.py '
@@ -2969,7 +3003,8 @@ def _run_worker_round(pending_df: pd.DataFrame, total_rows: int, output_csv: str
                   args.gpu_mem_fraction, args.download_workers, args.prefetch,
                   progress_counter, progress_lock, round_id, download_semaphore,
                   ocr_semaphore, args.gpu_mem_limit_mb, worker_progress,
-                  args.scan_crop_upscale, args.scan_crop_candidates),
+                  args.scan_crop_upscale, args.scan_crop_candidates,
+                  args.scan_crop_upscale_lobs),
             name=f"ocr-worker-{k}" if round_id == 0 else f"ocr-retry{round_id}-worker-{k}",
         )
         p.start()
@@ -3078,10 +3113,12 @@ def main():
           f"{str(args.gpu_mem_limit_mb) + 'MB' if args.gpu_mem_limit_mb else '不限制'}"
           f"（workers={args.workers}，合计约 "
           f"{args.gpu_mem_limit_mb * args.workers // 1024 if args.gpu_mem_limit_mb else 0}GB）")
-    print(f"紫贴局部OCR: 放大到长边 "
-          f"{args.scan_crop_upscale if args.scan_crop_upscale > 0 else '关闭'}"
-          f"，每图最多 {args.scan_crop_candidates} 个候选"
-          f"（启用 LOB: {'/'.join(sorted(SCAN_LOCAL_CROP_LOBS))} + 全部配件）")
+    _up_lobs = args.scan_crop_upscale_lobs
+    print(f"紫贴局部OCR: 启用 LOB {'/'.join(sorted(SCAN_LOCAL_CROP_LOBS))} + 全部配件，"
+          f"每图最多 {args.scan_crop_candidates} 个候选")
+    print(f"  其中放大到长边 {args.scan_crop_upscale}: "
+          f"{'/'.join(sorted(_up_lobs)) if _up_lobs and args.scan_crop_upscale > 0 else '无（全部不放大）'}"
+          f"（其余 LOB 原尺寸送 OCR）")
     print(f"自动补下载重试轮数: {args.extra_retry_passes}（0=关闭）")
     print(f"分片文件:    {os.path.splitext(output_csv)[0]}.wshard*.csv / .jsonl / .log")
     print("=" * 80)

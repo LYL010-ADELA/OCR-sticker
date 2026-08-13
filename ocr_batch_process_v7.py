@@ -124,6 +124,28 @@ V7.6（2026-08-12）：行完整性根治——输出行数必须等于源表行
      丢行不可能再静默发生。
   4. 断点续传同步改为按源行号判定，订单号重复时不会误跳过兄弟行。
 
+V7.7（2026-08-13）：Mac 召回改进——紫贴局部 OCR 对 Mac 开放 + 补上真正的放大
+  0808/0809 两批 Mac 无贴率 35-36%（其余 LOB：iPhone 2.8%、Watch 1.1%），
+  且失败 100% 是"未找到含'扫码即领'的背面图"——锚点根本没读到，不是位置判
+  出去的。根因是 Mac 的检测路径最薄：紫贴局部 OCR 与旋转兜底此前只对
+  Watch/AirPods/配件开放，Mac 只有一次机会（单张 0° 整图 OCR）；而 MacBook
+  是最大的包装盒，拍全就必然拍远，封口贴占的像素最少，再被 OCR_MAX_SIDE
+  整体缩小（实测源图长边 4839 → 3000，仅 0.62 倍）后字就没了。
+  1. Mac 加入 SCAN_LOCAL_CROP_LOBS，启用 0° 紫贴局部 OCR。真实漏检行实测
+     救回 35%（紫色候选检出率 20/20，该路径对棕色纸箱同样有效）。
+     旋转兜底仍由 SCAN_ORIENTATION_FALLBACK_LOBS 控制、Mac 不在其中——旋转
+     对 Mac 未实测，且开销是 0° 的数倍，不盲目开。
+  2. 紫贴 crop 送 OCR 前放大到长边 SCAN_CROP_UPSCALE_TO=2000。此前"局部放大
+     OCR"名不副实：resize_for_ocr 只会缩小、从不放大，小 crop 原样进 OCR，
+     字还是那么小。补上后实测救回 35% → 45%。放大后 crop 最多 4M 像素，
+     比整图最坏的 9M 还省显存，不引入新 OOM 风险；Watch/AirPods/配件同样受益。
+  3. 放大后必须把 OCR 返回的 poly 按放大倍数除回原 crop 尺度再偏移到整图
+     坐标，否则贴纸位置系统性外扩 → rel_x/rel_y 越界 → 位置校验误判。
+  验证工具见 diagnose_lob_recall.py（在真实漏检行上量测各路径召回）。
+  注：Mac 的位置校验实际早已形同虚设——两个镜像区域配 ±0.25 容差展开后是
+  X∈[0,1]、Y∈[-0.25,1.25]，任何落在盒面内的贴纸都算规范；仅有的判否是
+  rel_x>1.0（贴纸被检到盒外，属坐标映射误差）。故本次只改召回、不动判定口径。
+
 以下为 V5 说明（Watch/AirPods 锚点增强，V6/V7 未改动核心检测）：
 
 V5 相对 V4 的核心改动：
@@ -273,9 +295,23 @@ OCR_DET_LIMIT_SIDE_LEN = 3000
 # V5：Watch/AirPods 的封贴文字常因竖拍、倒拍、贴纸小而被整图 OCR 漏掉。
 # 仅对这两个 LOB 启用增强，控制额外耗时和误触发面。
 SCAN_ORIENTATION_FALLBACK_LOBS = {"Watch", "AirPods"}
-SCAN_LOCAL_CROP_LOBS           = {"Watch", "AirPods"}
+# V7.7：加入 Mac —— MacBook 是最大的包装盒，拍全就必然拍远，封口贴占的像素最少，
+# 再被 OCR_MAX_SIDE 整体缩小（实测源图长边 4839 → 3000，仅 0.62 倍）后字就没了。
+# 0808/0809 两批 Mac 无贴率 35-36%，且失败 100% 是"未找到含'扫码即领'的背面图"
+# （锚点没读到，而非位置判出去）。真实漏检行上实测：加本兜底可救回 35%，
+# 配合下面的 crop 放大可救回 45%（详见 diagnose_lob_recall.py）。
+# 注意本集合只控制 0° 紫贴局部 OCR；旋转兜底由 SCAN_ORIENTATION_FALLBACK_LOBS
+# 决定，Mac 不在其中，因此加进来不会引入旋转扫描的额外开销（旋转对 Mac 未实测）。
+SCAN_LOCAL_CROP_LOBS           = {"Watch", "AirPods", "Mac"}
 SCAN_OCR_ANGLES                = (0, 90, 180, 270)
 SCAN_LOCAL_CROP_MAX_CANDIDATES = 5
+
+# V7.7：紫贴局部 crop 送入 OCR 前放大到的长边。
+# 此前 "局部放大 OCR" 名不副实——resize_for_ocr 只会缩小、从不放大，小 crop 原样
+# 进 OCR，字还是那么小，白付了一次推理。补上放大后实测召回 35% → 45%。
+# 2000 的另一个好处：放大后的 crop 最多 2000×2000=4M 像素，比整图最坏情况
+# 3000×3000=9M 还省显存，不会引入新的 OOM 风险。
+SCAN_CROP_UPSCALE_TO = 2000
 
 # 官方封口贴紫色条带 HSV 范围（OpenCV H: 0-179）。这里只作为局部 OCR 候选，
 # 不直接判定有贴，因此阈值宁可略宽。
@@ -832,6 +868,24 @@ def find_purple_scan_candidate_boxes(image_pil: Image.Image,
         return []
 
 
+def upscale_crop_for_ocr(crop: Image.Image,
+                         target_long_side: int = SCAN_CROP_UPSCALE_TO
+                         ) -> tuple[Image.Image, float]:
+    """把小 crop 放大到 target_long_side 长边，返回 (放大后图, 放大倍数)。
+
+    V7.7：只放大、不缩小（更大的 crop 交给 ocr_image_full 里的 resize_for_ocr
+    按 OCR_MAX_SIDE 处理，行为与此前一致，不引入回归）。
+    """
+    w, h = crop.size
+    long_side = max(w, h)
+    if long_side <= 0 or long_side >= target_long_side:
+        return crop, 1.0
+    scale = target_long_side / long_side
+    resized = crop.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                          resample=Image.LANCZOS)
+    return resized, scale
+
+
 def ocr_scan_candidate_crops(image: Image.Image,
                              base_texts: list[str],
                              base_polys: list,
@@ -844,8 +898,17 @@ def ocr_scan_candidate_crops(image: Image.Image,
 
     for ci, (x1, y1, x2, y2) in enumerate(boxes, 1):
         crop = image.crop((x1, y1, x2, y2))
-        full_text, texts, polys, orig_h, orig_w = ocr_image_full(crop, f"{image_id}_purple{ci}")
+        crop_in, up_scale = upscale_crop_for_ocr(crop)
+        full_text, texts, polys, orig_h, orig_w = ocr_image_full(
+            crop_in, f"{image_id}_purple{ci}")
         if has_scan_text(texts):
+            # ocr_image_full 返回的 poly 已映射回"它收到的那张图"的尺寸，即放大后的
+            # crop 坐标系；必须先按放大倍数除回原始 crop 尺度，再偏移到整图坐标。
+            # 漏掉这一步会让贴纸位置整体外扩 up_scale 倍 → rel_x/rel_y 越界 →
+            # 位置校验误判（Watch/AirPods 尤其明显，它们的规范区间比 Mac 严格）。
+            if up_scale != 1.0:
+                polys = [[[pt[0] / up_scale, pt[1] / up_scale] for pt in poly]
+                         for poly in polys]
             mapped_polys = offset_polys(polys, x1, y1)
             return {
                 "texts": list(base_texts or []) + list(texts or []),

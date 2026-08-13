@@ -795,12 +795,17 @@ def _box_iou(a, b) -> float:
 
 
 def find_purple_scan_candidate_boxes(image_pil: Image.Image,
-                                     max_candidates: int = SCAN_LOCAL_CROP_MAX_CANDIDATES) -> list[tuple[int, int, int, int]]:
+                                     max_candidates: int | None = None) -> list[tuple[int, int, int, int]]:
     """找紫色官方封贴条带附近的 crop，用于局部放大 OCR。
 
     注意：紫色只作为候选，不直接代表"封口贴存在"。最终仍必须 OCR 命中
     "扫码即领"锚点，避免把官方印刷紫色条带误当作封贴。
+
+    max_candidates=None 时在调用时读取全局配置——不能把全局当默认参数值，
+    那是在函数定义时求值的，worker 里改全局（--scan-crop-* 旋钮）不会生效。
     """
+    if max_candidates is None:
+        max_candidates = SCAN_LOCAL_CROP_MAX_CANDIDATES
     try:
         img_cv = pil_to_cv(image_pil)
         H, W = img_cv.shape[:2]
@@ -869,16 +874,21 @@ def find_purple_scan_candidate_boxes(image_pil: Image.Image,
 
 
 def upscale_crop_for_ocr(crop: Image.Image,
-                         target_long_side: int = SCAN_CROP_UPSCALE_TO
+                         target_long_side: int | None = None
                          ) -> tuple[Image.Image, float]:
     """把小 crop 放大到 target_long_side 长边，返回 (放大后图, 放大倍数)。
 
     V7.7：只放大、不缩小（更大的 crop 交给 ocr_image_full 里的 resize_for_ocr
     按 OCR_MAX_SIDE 处理，行为与此前一致，不引入回归）。
+
+    target_long_side=None 时在调用时读取全局（见 find_purple_scan_candidate_boxes
+    的同类说明）；<=0 表示关闭放大，退回 V7.6 及以前的行为。
     """
+    if target_long_side is None:
+        target_long_side = SCAN_CROP_UPSCALE_TO
     w, h = crop.size
     long_side = max(w, h)
-    if long_side <= 0 or long_side >= target_long_side:
+    if target_long_side <= 0 or long_side <= 0 or long_side >= target_long_side:
         return crop, 1.0
     scale = target_long_side / long_side
     resized = crop.resize((max(1, int(w * scale)), max(1, int(h * scale))),
@@ -890,7 +900,7 @@ def ocr_scan_candidate_crops(image: Image.Image,
                              base_texts: list[str],
                              base_polys: list,
                              image_id: str,
-                             max_candidates: int = SCAN_LOCAL_CROP_MAX_CANDIDATES):
+                             max_candidates: int | None = None):
     """对紫色候选 crop 做 OCR，命中扫码锚点时把 crop OCR 结果映射回整图坐标。"""
     boxes = find_purple_scan_candidate_boxes(image, max_candidates=max_candidates)
     if not boxes:
@@ -2658,7 +2668,9 @@ def worker_main(worker_id: int,
                 download_semaphore=None,
                 ocr_semaphore=None,
                 gpu_mem_limit_mb: int = 0,
-                worker_progress=None):
+                worker_progress=None,
+                scan_crop_upscale: int | None = None,
+                scan_crop_candidates: int | None = None):
     """单个 worker 进程：初始化自己的 PaddleOCR，串行处理分到的行（内部预取下载），
     结果写入自己的分片文件。逐行详细日志重定向到分片 .log 文件，保持终端整洁。
 
@@ -2668,7 +2680,16 @@ def worker_main(worker_id: int,
 
     V7.5：worker_progress 是跨进程共享的每 worker 已落盘行数数组——主进程用它
     判断"OOM 重启后是否有实际进展"（连续多次重启零进展则放弃重启）。
+
+    V7.7：scan_crop_* 是紫贴局部 OCR 的调优旋钮。必须显式传进来并在此写回模块
+    全局——CUDA 要求 spawn 启动方式，子进程是重新 import 本模块的，主进程解析
+    到的 args 不会自动出现在这里。
     """
+    global SCAN_CROP_UPSCALE_TO, SCAN_LOCAL_CROP_MAX_CANDIDATES
+    if scan_crop_upscale is not None:
+        SCAN_CROP_UPSCALE_TO = scan_crop_upscale
+    if scan_crop_candidates is not None:
+        SCAN_LOCAL_CROP_MAX_CANDIDATES = scan_crop_candidates
     csv_shard, json_shard, log_shard = _shard_paths(output_csv, worker_id, round_id)
     tag = f"[W{worker_id}]" if not round_id else f"[W{worker_id}][重试轮{round_id}]"
 
@@ -2893,6 +2914,16 @@ def parse_args():
                    help=f'整图 OCR 全局并发上限（缺省 {DEFAULT_OCR_CONCURRENCY}）。'
                         f'仅长边≥{OCR_GATE_MIN_SIDE}px 的大图推理占名额，'
                         '防止多个 worker 同时到达显存峰值互相挤兑（瞬时 OOM）')
+    p.add_argument('--scan-crop-upscale', type=int, default=SCAN_CROP_UPSCALE_TO,
+                   help=f'紫贴局部 crop 送 OCR 前放大到的长边（缺省 '
+                        f'{SCAN_CROP_UPSCALE_TO}；0=关闭放大，退回 V7.6 行为）。'
+                        '放大是 Mac 召回从 35%% 提到 45%% 的关键，但会增加 crop '
+                        'OCR 的像素量；嫌慢可降到 1400 左右先试')
+    p.add_argument('--scan-crop-candidates', type=int,
+                   default=SCAN_LOCAL_CROP_MAX_CANDIDATES,
+                   help=f'每张图最多做几个紫贴候选的局部 OCR（缺省 '
+                        f'{SCAN_LOCAL_CROP_MAX_CANDIDATES}）。命中即停，所以只有'
+                        '漏检行才会跑满；调小可直接线性削减漏检行的开销')
     p.add_argument('--extra-retry-passes', type=int,
                    default=DEFAULT_EXTRA_RETRY_PASSES,
                    help='主批次跑完后，自动对"封口贴存在≠1"的行做的补下载重试轮数'
@@ -2937,7 +2968,8 @@ def _run_worker_round(pending_df: pd.DataFrame, total_rows: int, output_csv: str
             args=(k, shards[k], total_rows, output_csv,
                   args.gpu_mem_fraction, args.download_workers, args.prefetch,
                   progress_counter, progress_lock, round_id, download_semaphore,
-                  ocr_semaphore, args.gpu_mem_limit_mb, worker_progress),
+                  ocr_semaphore, args.gpu_mem_limit_mb, worker_progress,
+                  args.scan_crop_upscale, args.scan_crop_candidates),
             name=f"ocr-worker-{k}" if round_id == 0 else f"ocr-retry{round_id}-worker-{k}",
         )
         p.start()
@@ -3046,6 +3078,10 @@ def main():
           f"{str(args.gpu_mem_limit_mb) + 'MB' if args.gpu_mem_limit_mb else '不限制'}"
           f"（workers={args.workers}，合计约 "
           f"{args.gpu_mem_limit_mb * args.workers // 1024 if args.gpu_mem_limit_mb else 0}GB）")
+    print(f"紫贴局部OCR: 放大到长边 "
+          f"{args.scan_crop_upscale if args.scan_crop_upscale > 0 else '关闭'}"
+          f"，每图最多 {args.scan_crop_candidates} 个候选"
+          f"（启用 LOB: {'/'.join(sorted(SCAN_LOCAL_CROP_LOBS))} + 全部配件）")
     print(f"自动补下载重试轮数: {args.extra_retry_passes}（0=关闭）")
     print(f"分片文件:    {os.path.splitext(output_csv)[0]}.wshard*.csv / .jsonl / .log")
     print("=" * 80)

@@ -25,6 +25,7 @@
 import argparse
 import os
 import sys
+import time
 
 import pandas as pd
 from PIL import Image
@@ -129,6 +130,8 @@ def main():
     rows_with_purple = 0
     long_sides, n_images = [], 0
     cached = []          # (tag, [(cid, img)]) 供变体D 复用，避免重复下载
+    # 每张图各阶段耗时（秒），用于回答"开了这个会慢多少"
+    secs_a, secs_b, secs_c = [], [], []
 
     for i, (_, row) in enumerate(sample.iterrows(), 1):
         oid = str(row.get('订单号', ''))[:20]
@@ -145,15 +148,22 @@ def main():
         purple_here = 0
         for cid, img in imgs:
             iid = f"{tag}_{cid}"
+            t0 = time.perf_counter()
             if not a and full_ocr_hit(img, iid):
                 a = True
+            t1 = time.perf_counter()
             hb, nb = crop_scan_hit(img, iid, None)
+            t2 = time.perf_counter()
             purple_here += nb
             if hb:
                 b = True
             hc, _ = crop_scan_hit(img, iid, args.upscale)
+            t3 = time.perf_counter()
             if hc:
                 c = True
+            secs_a.append(t1 - t0)
+            secs_b.append(t2 - t1)
+            secs_c.append(t3 - t2)
             if a and b and c:
                 break
 
@@ -207,6 +217,27 @@ def main():
     if hit_d is not None:
         line(f'D 0°整图长边≤{args.hires}', hit_d, '← 缩放是否为主因')
     print('=' * 76)
+
+    # ── 开销：只有"0° 未命中的图"才会付紫贴的钱，命中即停 ──────────────────
+    if secs_a:
+        avg_a = sum(secs_a) / len(secs_a)
+        avg_b = sum(secs_b) / len(secs_b)
+        avg_c = sum(secs_c) / len(secs_c)
+        print(f"\n单张图平均耗时（{len(secs_a)} 张，均为 0° 未命中的图——"
+              f"命中的图不会走紫贴路径，不付这个钱）:")
+        print(f"  0° 整图 OCR（本来就有）      {avg_a * 1000:7.0f} ms")
+        print(f"  + 紫贴crop 不放大            {avg_b * 1000:7.0f} ms  "
+              f"(×{avg_b / avg_a:.2f} 于整图)")
+        print(f"  + 紫贴crop 放大到{args.upscale:<5}       {avg_c * 1000:7.0f} ms  "
+              f"(×{avg_c / avg_a:.2f} 于整图)")
+        print(f"\n  → 生产开启后，一张 0° 未命中的图从 {avg_a * 1000:.0f}ms 变为 "
+              f"{(avg_a + avg_c) * 1000:.0f}ms（{(avg_a + avg_c) / avg_a:.1f} 倍）")
+        print(f"  → 换算到整批：只有漏检行的图付这个钱。若某 LOB 占全批 P%%、"
+              f"其中 Q%% 的图 0° 未命中，")
+        print(f"     整批增幅 ≈ P%% × Q%% × {(avg_c / avg_a):.1f}"
+              f"（例：Mac 占 1.4%%、九成图未命中 → 约 "
+              f"+{1.4 * 0.9 * (avg_c / avg_a):.1f}%%）")
+
     print("\n判读：")
     print("  · 紫色候选检出率低 → 紫贴路径对该 LOB 无效，得另想办法（分块 OCR 等）")
     print("  · C 明显高于 B    → 放大是关键，值得把放大补进生产路径")

@@ -66,6 +66,55 @@ def crop_scan_hit(img: Image.Image, image_id: str,
     return False, len(boxes)
 
 
+def crop_compare(img: Image.Image, image_id: str, upscale_to: int,
+                 dump_dir: str | None, tag: str, records: list
+                 ) -> tuple[bool, bool, int]:
+    """逐个紫贴候选同时跑"不放大"和"放大"两种 OCR，便于逐框对照放大的效果。
+
+    返回 (不放大是否命中, 放大是否命中, 候选个数)。两边各自"命中即停"，
+    与生产逻辑一致；dump_dir 非空时把两种尺寸的 crop 都存盘供肉眼比对。
+    """
+    boxes = V7.find_purple_scan_candidate_boxes(
+        img, max_candidates=V7.SCAN_LOCAL_CROP_MAX_CANDIDATES)
+    hit_plain = hit_up = False
+    for ci, (x1, y1, x2, y2) in enumerate(boxes, 1):
+        crop = img.crop((x1, y1, x2, y2))
+        crop_up = upscale(crop, upscale_to)
+        up_factor = max(crop_up.size) / max(1, max(crop.size))
+
+        # 已命中的那一路不再跑后续候选（与生产的"命中即停"一致），记录里显式
+        # 标注为跳过，避免看 CSV 时把"没跑"误读成"读不出来"。
+        txt_plain = '' if not hit_plain else '(已命中,跳过)'
+        txt_up = '' if not hit_up else '(已命中,跳过)'
+        if not hit_plain:
+            t, texts, _, _, _ = V7.ocr_image_full(crop, f"{image_id}_p{ci}")
+            txt_plain = t
+            if V7.has_scan_text(texts):
+                hit_plain = True
+        if not hit_up:
+            t, texts, _, _, _ = V7.ocr_image_full(crop_up, f"{image_id}_p{ci}up")
+            txt_up = t
+            if V7.has_scan_text(texts):
+                hit_up = True
+
+        if dump_dir:
+            os.makedirs(dump_dir, exist_ok=True)
+            base = f"{tag}_{image_id.split('_')[-1]}_p{ci}"
+            crop.save(os.path.join(dump_dir, f"{base}_1原始{crop.size[0]}x{crop.size[1]}.jpg"),
+                      quality=92)
+            crop_up.save(os.path.join(dump_dir, f"{base}_2放大{crop_up.size[0]}x{crop_up.size[1]}.jpg"),
+                         quality=92)
+        records.append({
+            '订单号': tag, '图': image_id.split('_')[-1], '候选': ci,
+            'crop尺寸': f"{crop.size[0]}x{crop.size[1]}",
+            '放大倍数': round(up_factor, 2),
+            '不放大读到': txt_plain[:60], '放大后读到': txt_up[:60],
+        })
+        if hit_plain and hit_up:
+            break
+    return hit_plain, hit_up, len(boxes)
+
+
 def collect_row_images(row, cols, save_dir, tag) -> list[tuple[str, Image.Image]]:
     out = []
     for ci, col in enumerate(cols, 1):
@@ -96,7 +145,10 @@ def main():
     ap.add_argument('--no-hires', action='store_true', help='跳过变体D（省一次引擎重建）')
     ap.add_argument('--gpu-mem-limit-mb', type=int, default=0,
                     help='单进程诊断，缺省 0=不限制')
-    ap.add_argument('--save-images', default=None, help='把漏检行的图片存到该目录供人工查看')
+    ap.add_argument('--save-images', default=None, help='把漏检行的整图存到该目录供人工查看')
+    ap.add_argument('--dump-crops', default=None,
+                    help='把每个紫贴候选的 crop 按"原始/放大"两种尺寸存到该目录，'
+                         '并导出逐框的 OCR 文字对照表——最直观地看放大到底起了什么作用')
     args = ap.parse_args()
 
     df = pd.read_csv(args.results_csv, encoding='utf-8-sig', dtype=str)
@@ -131,7 +183,8 @@ def main():
     long_sides, n_images = [], 0
     cached = []          # (tag, [(cid, img)]) 供变体D 复用，避免重复下载
     # 每张图各阶段耗时（秒），用于回答"开了这个会慢多少"
-    secs_a, secs_b, secs_c = [], [], []
+    secs_a, secs_bc = [], []
+    crop_records = []      # 逐候选的"不放大 vs 放大"读到了什么
 
     for i, (_, row) in enumerate(sample.iterrows(), 1):
         oid = str(row.get('订单号', ''))[:20]
@@ -152,18 +205,16 @@ def main():
             if not a and full_ocr_hit(img, iid):
                 a = True
             t1 = time.perf_counter()
-            hb, nb = crop_scan_hit(img, iid, None)
+            hb, hc, nb = crop_compare(img, iid, args.upscale,
+                                      args.dump_crops, oid, crop_records)
             t2 = time.perf_counter()
             purple_here += nb
             if hb:
                 b = True
-            hc, _ = crop_scan_hit(img, iid, args.upscale)
-            t3 = time.perf_counter()
             if hc:
                 c = True
             secs_a.append(t1 - t0)
-            secs_b.append(t2 - t1)
-            secs_c.append(t3 - t2)
+            secs_bc.append(t2 - t1)
             if a and b and c:
                 break
 
@@ -221,22 +272,39 @@ def main():
     # ── 开销：只有"0° 未命中的图"才会付紫贴的钱，命中即停 ──────────────────
     if secs_a:
         avg_a = sum(secs_a) / len(secs_a)
-        avg_b = sum(secs_b) / len(secs_b)
-        avg_c = sum(secs_c) / len(secs_c)
+        avg_bc = sum(secs_bc) / len(secs_bc)
         print(f"\n单张图平均耗时（{len(secs_a)} 张，均为 0° 未命中的图——"
               f"命中的图不会走紫贴路径，不付这个钱）:")
-        print(f"  0° 整图 OCR（本来就有）      {avg_a * 1000:7.0f} ms")
-        print(f"  + 紫贴crop 不放大            {avg_b * 1000:7.0f} ms  "
-              f"(×{avg_b / avg_a:.2f} 于整图)")
-        print(f"  + 紫贴crop 放大到{args.upscale:<5}       {avg_c * 1000:7.0f} ms  "
-              f"(×{avg_c / avg_a:.2f} 于整图)")
-        print(f"\n  → 生产开启后，一张 0° 未命中的图从 {avg_a * 1000:.0f}ms 变为 "
-              f"{(avg_a + avg_c) * 1000:.0f}ms（{(avg_a + avg_c) / avg_a:.1f} 倍）")
-        print(f"  → 换算到整批：只有漏检行的图付这个钱。若某 LOB 占全批 P%%、"
-              f"其中 Q%% 的图 0° 未命中，")
-        print(f"     整批增幅 ≈ P%% × Q%% × {(avg_c / avg_a):.1f}"
-              f"（例：Mac 占 1.4%%、九成图未命中 → 约 "
-              f"+{1.4 * 0.9 * (avg_c / avg_a):.1f}%%）")
+        print(f"  0° 整图 OCR（本来就有）              {avg_a * 1000:7.0f} ms")
+        print(f"  + 紫贴crop（本测试同时跑了两种尺寸）  {avg_bc * 1000:7.0f} ms")
+        print(f"  注：生产只跑其中一种，实际增量约为上面的一半"
+              f"（≈{avg_bc / 2 * 1000:.0f} ms/图，即整图的 {avg_bc / 2 / avg_a:.2f} 倍）")
+        est = 1.4 * 0.9 * (avg_bc / 2 / avg_a)
+        print(f"  → 换算整批：只有漏检行付这个钱。Mac 占全批约 1.4%%、九成图未命中 "
+              f"→ 增幅约 +{est:.1f}%%")
+
+    # ── 逐框对照：放大到底改变了什么 ────────────────────────────────────
+    if crop_records:
+        flipped = [r for r in crop_records
+                   if r['放大后读到'] and '扫码' in r['放大后读到']
+                   and '扫码' not in (r['不放大读到'] or '')]
+        print(f"\n逐候选对照：共 {len(crop_records)} 个紫贴候选，"
+              f"其中 {len(flipped)} 个是【放大后才读出『扫码』】")
+        show = (flipped or crop_records)[:8]
+        for r in show:
+            print(f"\n  订单{r['订单号']} {r['图']} 候选{r['候选']}  "
+                  f"crop {r['crop尺寸']} → 放大 {r['放大倍数']}×")
+            print(f"    不放大读到: {r['不放大读到'] or '(空)'}")
+            print(f"    放大后读到: {r['放大后读到'] or '(空)'}")
+        if args.dump_crops:
+            csv_path = os.path.join(args.dump_crops, '_crop对照表.csv')
+            pd.DataFrame(crop_records).to_csv(csv_path, index=False,
+                                              encoding='utf-8-sig')
+            n_img = len([f for f in os.listdir(args.dump_crops)
+                         if f.endswith('.jpg')])
+            print(f"\n  已存 {n_img} 张 crop 图到 {args.dump_crops}/")
+            print(f"  文件名带 _1原始 / _2放大 后缀，排序后自然成对，方便逐对比较")
+            print(f"  逐框 OCR 文字对照表: {csv_path}")
 
     print("\n判读：")
     print("  · 紫色候选检出率低 → 紫贴路径对该 LOB 无效，得另想办法（分块 OCR 等）")

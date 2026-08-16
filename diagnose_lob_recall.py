@@ -67,12 +67,17 @@ def crop_scan_hit(img: Image.Image, image_id: str,
 
 
 def crop_compare(img: Image.Image, image_id: str, upscale_to: int,
-                 dump_dir: str | None, tag: str, records: list
+                 dump_dir: str | None, tag: str, records: list,
+                 dumped: list, dump_limit: int = 40, dump_all: bool = False
                  ) -> tuple[bool, bool, int]:
     """逐个紫贴候选同时跑"不放大"和"放大"两种 OCR，便于逐框对照放大的效果。
 
     返回 (不放大是否命中, 放大是否命中, 候选个数)。两边各自"命中即停"，
-    与生产逻辑一致；dump_dir 非空时把两种尺寸的 crop 都存盘供肉眼比对。
+    与生产逻辑一致。
+
+    存盘策略（dump_dir 非空时）：默认只存"放大后才读出锚点"的那几对——它们才
+    说明放大起了什么作用；其余候选存了没信息量，20 行样本能产生近 400 张图纯粹
+    占地方。dump_all=True 才全量存，dump_limit 是文件数硬上限。
     """
     boxes = V7.find_purple_scan_candidate_boxes(
         img, max_candidates=V7.SCAN_LOCAL_CROP_MAX_CANDIDATES)
@@ -86,24 +91,30 @@ def crop_compare(img: Image.Image, image_id: str, upscale_to: int,
         # 标注为跳过，避免看 CSV 时把"没跑"误读成"读不出来"。
         txt_plain = '' if not hit_plain else '(已命中,跳过)'
         txt_up = '' if not hit_up else '(已命中,跳过)'
+        plain_read_anchor = up_read_anchor = False
         if not hit_plain:
             t, texts, _, _, _ = V7.ocr_image_full(crop, f"{image_id}_p{ci}")
             txt_plain = t
-            if V7.has_scan_text(texts):
-                hit_plain = True
+            plain_read_anchor = V7.has_scan_text(texts)
+            hit_plain = hit_plain or plain_read_anchor
         if not hit_up:
             t, texts, _, _, _ = V7.ocr_image_full(crop_up, f"{image_id}_p{ci}up")
             txt_up = t
-            if V7.has_scan_text(texts):
-                hit_up = True
+            up_read_anchor = V7.has_scan_text(texts)
+            hit_up = hit_up or up_read_anchor
 
-        if dump_dir:
+        # 只存"放大后才读出锚点"的那几对——它们才说明放大起了什么作用。
+        # 其余候选（两边都读不出、或不放大就已读出）存了也没信息量，
+        # 20 行样本会产生近 400 张图纯属占地方。全量存用 --dump-all。
+        worth_dumping = (up_read_anchor and not plain_read_anchor) or dump_all
+        if dump_dir and worth_dumping and len(dumped) < dump_limit:
             os.makedirs(dump_dir, exist_ok=True)
             base = f"{tag}_{image_id.split('_')[-1]}_p{ci}"
-            crop.save(os.path.join(dump_dir, f"{base}_1原始{crop.size[0]}x{crop.size[1]}.jpg"),
-                      quality=92)
-            crop_up.save(os.path.join(dump_dir, f"{base}_2放大{crop_up.size[0]}x{crop_up.size[1]}.jpg"),
-                         quality=92)
+            p1 = os.path.join(dump_dir, f"{base}_1原始{crop.size[0]}x{crop.size[1]}.jpg")
+            p2 = os.path.join(dump_dir, f"{base}_2放大{crop_up.size[0]}x{crop_up.size[1]}.jpg")
+            crop.save(p1, quality=92)
+            crop_up.save(p2, quality=92)
+            dumped.extend([p1, p2])
         records.append({
             '订单号': tag, '图': image_id.split('_')[-1], '候选': ci,
             'crop尺寸': f"{crop.size[0]}x{crop.size[1]}",
@@ -147,8 +158,12 @@ def main():
                     help='单进程诊断，缺省 0=不限制')
     ap.add_argument('--save-images', default=None, help='把漏检行的整图存到该目录供人工查看')
     ap.add_argument('--dump-crops', default=None,
-                    help='把每个紫贴候选的 crop 按"原始/放大"两种尺寸存到该目录，'
-                         '并导出逐框的 OCR 文字对照表——最直观地看放大到底起了什么作用')
+                    help='存 crop 图到该目录用于肉眼比对（缺省不存任何文件）。'
+                         '只存"放大后才读出锚点"的那几对，其余候选没有信息量')
+    ap.add_argument('--dump-limit', type=int, default=40,
+                    help='最多存几个 crop 文件（缺省 40，即 20 对）')
+    ap.add_argument('--dump-all', action='store_true',
+                    help='存全部候选而不只是放大后才读出的那些（会产生几百张图，慎用）')
     args = ap.parse_args()
 
     df = pd.read_csv(args.results_csv, encoding='utf-8-sig', dtype=str)
@@ -185,6 +200,7 @@ def main():
     # 每张图各阶段耗时（秒），用于回答"开了这个会慢多少"
     secs_a, secs_bc = [], []
     crop_records = []      # 逐候选的"不放大 vs 放大"读到了什么
+    dumped_files = []      # 实际存盘的 crop 图（默认只存放大后才读出的那几对）
 
     for i, (_, row) in enumerate(sample.iterrows(), 1):
         oid = str(row.get('订单号', ''))[:20]
@@ -206,7 +222,8 @@ def main():
                 a = True
             t1 = time.perf_counter()
             hb, hc, nb = crop_compare(img, iid, args.upscale,
-                                      args.dump_crops, oid, crop_records)
+                                      args.dump_crops, oid, crop_records,
+                                      dumped_files, args.dump_limit, args.dump_all)
             t2 = time.perf_counter()
             purple_here += nb
             if hb:
@@ -296,15 +313,22 @@ def main():
                   f"crop {r['crop尺寸']} → 放大 {r['放大倍数']}×")
             print(f"    不放大读到: {r['不放大读到'] or '(空)'}")
             print(f"    放大后读到: {r['放大后读到'] or '(空)'}")
-        if args.dump_crops:
+        if args.dump_crops and dumped_files:
             csv_path = os.path.join(args.dump_crops, '_crop对照表.csv')
             pd.DataFrame(crop_records).to_csv(csv_path, index=False,
                                               encoding='utf-8-sig')
-            n_img = len([f for f in os.listdir(args.dump_crops)
-                         if f.endswith('.jpg')])
-            print(f"\n  已存 {n_img} 张 crop 图到 {args.dump_crops}/")
-            print(f"  文件名带 _1原始 / _2放大 后缀，排序后自然成对，方便逐对比较")
+            mb = sum(os.path.getsize(p) for p in dumped_files) / 1e6
+            print(f"\n  已存 {len(dumped_files)} 张 crop 图（{mb:.1f} MB）到 "
+                  f"{args.dump_crops}/"
+                  + ("" if args.dump_all else "——只含放大后才读出锚点的那几对"))
+            print(f"  文件名带 _1原始 / _2放大 后缀，排序后自然成对")
             print(f"  逐框 OCR 文字对照表: {csv_path}")
+            print(f"  看完直接删: rm -rf {args.dump_crops}")
+        elif args.dump_crops:
+            print("\n  没有『放大后才读出锚点』的候选，未存任何图片"
+                  "（想看全部加 --dump-all）")
+        else:
+            print("\n  （未存任何文件；需要肉眼比对时加 --dump-crops 目录名）")
 
     print("\n判读：")
     print("  · 紫色候选检出率低 → 紫贴路径对该 LOB 无效，得另想办法（分块 OCR 等）")

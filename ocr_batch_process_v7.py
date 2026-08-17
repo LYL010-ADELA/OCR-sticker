@@ -3004,6 +3004,11 @@ def parse_args():
                    help=f'每张图最多做几个紫贴候选的局部 OCR（缺省 '
                         f'{SCAN_LOCAL_CROP_MAX_CANDIDATES}）。命中即停，所以只有'
                         '漏检行才会跑满；调小可直接线性削减漏检行的开销')
+    p.add_argument('--rescan-lob', default='',
+                   help='强制重跑这些 LOB 中"封口贴存在≠1"的行，逗号分隔'
+                        '（例：--rescan-lob Mac）。断点续传默认把它们当已处理而'
+                        '跳过，检测逻辑改进后必须用本开关才能让旧结果享受新逻辑；'
+                        '已识别到封口贴的行不受影响，不会白跑')
     p.add_argument('--extra-retry-passes', type=int,
                    default=DEFAULT_EXTRA_RETRY_PASSES,
                    help='主批次跑完后，自动对"封口贴存在≠1"的行做的补下载重试轮数'
@@ -3013,6 +3018,8 @@ def parse_args():
     args.scan_crop_upscale_lobs = {s.strip() for s in
                                    str(args.scan_crop_upscale_lobs or '').split(',')
                                    if s.strip()}
+    args.rescan_lob = {s.strip() for s in str(args.rescan_lob or '').split(',')
+                       if s.strip()}
     if not args.input:
         p.error(
             '请提供输入 Excel 路径，例如：python ocr_batch_process_v7.py '
@@ -3189,6 +3196,32 @@ def main():
     n_processed = len(processed_pos) + len(processed_oids)
     if n_processed:
         print(f"发现已有分片结果，已处理 {n_processed} 行，仅处理剩余行…")
+
+    # V7.8：--rescan-lob 把指定 LOB 中"封口贴存在≠1"的行从已处理集合里摘出来，
+    # 让它们重跑。检测逻辑改进（如 V7.7/V7.8 对 Mac 的紫贴兜底与放大）只对新跑
+    # 的行生效；旧结果里这些行是"正常完成的 0"而非 ERROR，断点续传会跳过它们，
+    # 不摘出来的话改进对历史数据完全没作用。已识别到封口贴的行不动，不白跑。
+    if args.rescan_lob:
+        merged_now = _merge_frames(df, _collect_shard_frames(output_csv))
+        if merged_now is not None and len(merged_now) == len(df):
+            lob_col = '识别LOB' if '识别LOB' in merged_now.columns else 'LOB'
+            seal_now = pd.to_numeric(merged_now.get('封口贴存在'), errors='coerce')
+            rescan_mask = (merged_now[lob_col].astype(str).isin(args.rescan_lob)
+                           & (seal_now != 1)).to_numpy()
+            n_rescan = int(rescan_mask.sum())
+            if n_rescan:
+                processed_pos -= set(df.index[rescan_mask])
+                processed_oids -= set(
+                    df.loc[rescan_mask, '订单号'].astype(str).str.strip())
+                print(f"--rescan-lob {'/'.join(sorted(args.rescan_lob))}："
+                      f"把 {n_rescan} 行『封口贴存在≠1』的行标记为待重跑"
+                      f"（已识别到封口贴的行不动）")
+            else:
+                print(f"--rescan-lob {'/'.join(sorted(args.rescan_lob))}："
+                      f"没有『封口贴存在≠1』的行，无需重跑")
+        else:
+            print(f"  ⚠ --rescan-lob 需要与源表行数一致的已有结果才能定位重跑行"
+                  f"（当前结果缺失或行数不符），本次忽略该开关")
 
     # V7.6：源行号（新分片）与订单号（旧分片回退）两条判定取"都不认为已处理"
     pending_mask = (~df.index.isin(processed_pos)) & (

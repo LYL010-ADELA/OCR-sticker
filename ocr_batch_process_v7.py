@@ -152,6 +152,28 @@ V7.7（2026-08-13）：Mac 召回改进——紫贴局部 OCR 对 Mac 开放 + �
   X∈[0,1]、Y∈[-0.25,1.25]，任何落在盒面内的贴纸都算规范；仅有的判否是
   rel_x>1.0（贴纸被检到盒外，属坐标映射误差）。故本次只改召回、不动判定口径。
 
+V7.8（2026-08-17）：Mac 漏检根因不是"读不到字"，而是"从来没裁到贴纸"
+  0810 批次实测 V7.7 的收益远低于 0809 抽样的预期（召回 45% → 10%），且放大
+  几乎没生效（放大倍数普遍 1.0-2.1×）。下载真实漏检图逐像素查证，找到三条
+  互相叠加的根因，前两条本版修复：
+  1. 紫色 S 下限 35 太松：门店冷色调白台面/展柜的 S 中位仅 46（90 分位 54），
+     和真封口贴（S 中位 80-93）一起进了掩膜。而候选按紫色面积降序取前 5——
+     台面那一大片（260 万像素，真贴纸的 148 倍）稳占第 1 名，裁出来是整张图；
+     真封口贴排第 7、8 名，从来没被 OCR 过。Mac 的 S 下限提到 80 后真贴纸
+     升到第 2/3/5 名（提到 100 会误伤本地 AirPods 样本，故取 80）。
+  2. 垂直 padding 9 倍太夸张：真贴纸 81×175 被扩成 1539×561，放大到长边 2000
+     只有 1.30 倍，等于没放大。Mac 的封口贴是白底标签 + 折过盒边的紫色窄边，
+     文字就在紧邻紫边的白色部分，3 倍足够。改后 crop 567×561、放大 3.53 倍。
+     同一张真实图上前 5 候选：改前 0 个真贴纸、放大 1.00-2.11×；改后 3 个真
+     贴纸、放大 3.37-3.88×。
+  3. （未修，待测）Mac 封口贴折过盒边粘贴，正面拍摄时贴纸上的"扫码即领"文字
+     侧躺 90°，而 Mac 没有旋转兜底。但 pipeline 已开 use_textline_orientation，
+     且本版把 crop 放大了 3 倍多，可能已足够；先量测再决定是否为 Mac 开旋转
+     （开了成本约 ×3，见 SCAN_ORIENTATION_FALLBACK_LOBS）。
+  两项改动都只对 Mac 生效（SCAN_PURPLE_PROFILE_BY_LOB），其余 LOB 的参数逐
+  字节不变——它们漏检率本就低（Watch 1.1%、AirPods 4.4%），动阈值只有回归
+  风险没有收益。
+
 以下为 V5 说明（Watch/AirPods 锚点增强，V6/V7 未改动核心检测）：
 
 V5 相对 V4 的核心改动：
@@ -331,6 +353,24 @@ SCAN_CROP_UPSCALE_LOBS = {"Mac"}
 # 不直接判定有贴，因此阈值宁可略宽。
 SCAN_PURPLE_HSV_LOW  = (105, 35, 35)
 SCAN_PURPLE_HSV_HIGH = (165, 255, 245)
+
+# V7.8：按 LOB 覆盖紫贴候选的检测参数。0810 批次实测 Mac 漏检的根因不是"读不到
+# 字"而是"根本没裁到贴纸"：
+#   · S 下限 35 太松 —— 门店冷色调白台面/展柜的 S 中位仅 46（90 分位 54），却和
+#     真封口贴（S 中位 80-93）一起进了掩膜。而候选是按紫色面积降序取前 5 个，
+#     台面那一大片（260 万像素，是真贴纸的 148 倍）稳占第 1，裁出来是整张图；
+#     真封口贴排到第 7、8 名，从来没被 OCR 过。实测把 S 下限提到 80，真贴纸
+#     升到第 2/3/5 名，本地 Watch/AirPods 样本候选数均未归零（提到 100 会误伤）。
+#   · 垂直于条带方向 padding 9 倍太夸张 —— 真贴纸 81×175 会被扩成 1539×561，
+#     贴纸只占 crop 面积的 1.6%，再放大到长边 2000 也只有 1.30 倍，等于没放大。
+#     Mac 的封口贴是白底标签 + 折过盒边的紫色窄边，文字在紧邻紫边的白色部分，
+#     3 倍 padding 足够把字包进来（实测 crop 567×295，放大 3.4 倍，贴纸占 15%）。
+# 其余 LOB 一律保持原参数：它们漏检率本就低（Watch 1.1%、AirPods 4.4%），
+# 动阈值只有回归风险没有收益。
+SCAN_PURPLE_PROFILE_BY_LOB = {
+    "Mac": {"sat_min": 80, "perp_pad_mult": 3.0},
+}
+SCAN_PURPLE_PERP_PAD_MULT = 9.0      # 默认：垂直于条带方向的 padding 倍数
 
 # Watch/AirPods 的位置坐标若明显超出矫正盒面，多半是透视框选歪或文本映射异常。
 STRICT_UNIT_BOUNDS_MARGIN = 0.10
@@ -809,7 +849,8 @@ def _box_iou(a, b) -> float:
 
 
 def find_purple_scan_candidate_boxes(image_pil: Image.Image,
-                                     max_candidates: int | None = None) -> list[tuple[int, int, int, int]]:
+                                     max_candidates: int | None = None,
+                                     lob: str | None = None) -> list[tuple[int, int, int, int]]:
     """找紫色官方封贴条带附近的 crop，用于局部放大 OCR。
 
     注意：紫色只作为候选，不直接代表"封口贴存在"。最终仍必须 OCR 命中
@@ -820,6 +861,9 @@ def find_purple_scan_candidate_boxes(image_pil: Image.Image,
     """
     if max_candidates is None:
         max_candidates = SCAN_LOCAL_CROP_MAX_CANDIDATES
+    prof = SCAN_PURPLE_PROFILE_BY_LOB.get(lob or '', {})
+    sat_min = prof.get('sat_min', SCAN_PURPLE_HSV_LOW[1])
+    perp_mult = prof.get('perp_pad_mult', SCAN_PURPLE_PERP_PAD_MULT)
     try:
         img_cv = pil_to_cv(image_pil)
         H, W = img_cv.shape[:2]
@@ -829,7 +873,8 @@ def find_purple_scan_candidate_boxes(image_pil: Image.Image,
         hsv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(
             hsv,
-            np.array(SCAN_PURPLE_HSV_LOW, dtype=np.uint8),
+            np.array((SCAN_PURPLE_HSV_LOW[0], sat_min, SCAN_PURPLE_HSV_LOW[2]),
+                     dtype=np.uint8),
             np.array(SCAN_PURPLE_HSV_HIGH, dtype=np.uint8),
         )
         k3 = np.ones((3, 3), np.uint8)
@@ -854,11 +899,14 @@ def find_purple_scan_candidate_boxes(image_pil: Image.Image,
             if elongation < 1.8:
                 continue
 
+            # 沿条带方向扩 0.70 倍长度，垂直方向扩 perp_mult 倍厚度（文字在紧邻
+            # 紫边的白色标签上，所以垂直方向要扩得多）。Mac 用 3.0 而非默认 9.0，
+            # 见 SCAN_PURPLE_PROFILE_BY_LOB 注释。
             if w >= h:
                 xpad = max(int(w * 0.70), int(W * 0.04), 80)
-                ypad = max(int(h * 9.0), int(H * 0.06), 100)
+                ypad = max(int(h * perp_mult), int(H * 0.06), 100)
             else:
-                xpad = max(int(w * 9.0), int(W * 0.06), 100)
+                xpad = max(int(w * perp_mult), int(W * 0.06), 100)
                 ypad = max(int(h * 0.70), int(H * 0.04), 80)
 
             box = (
@@ -922,7 +970,8 @@ def ocr_scan_candidate_crops(image: Image.Image,
     拍得远、贴纸占像素少的 LOB 才需要放大；Watch/AirPods/配件盒小距离近，
     不放大也能读到，放大只是白付算力。lob=None 时不放大（保守）。
     """
-    boxes = find_purple_scan_candidate_boxes(image, max_candidates=max_candidates)
+    boxes = find_purple_scan_candidate_boxes(image, max_candidates=max_candidates,
+                                             lob=lob)
     if not boxes:
         return None
 

@@ -13,6 +13,8 @@
   C 紫贴crop放大 A + 局部 crop 放大到长边 --upscale 再 OCR
   D 整图高分辨率 0° 整图但长边上限提到 --hires（测"拍太远被缩小"是否为主因）
                  需要重建 OCR 引擎，故单独一轮；用 --no-hires 跳过
+  E crop旋转     C + 把 crop 旋转 90/180/270 再试（测"贴纸折过盒边、文字侧躺"）
+                 只在 C 对该图失败后才跑；用 --no-rot 跳过
 
 用法（在项目目录、GPU 空闲时跑）：
     python diagnose_lob_recall.py 出库照片处理后_0809_results.csv
@@ -132,6 +134,27 @@ def crop_compare(img: Image.Image, image_id: str, upscale_to: int,
     return hit_plain, hit_up, len(boxes)
 
 
+def crop_rot_hit(img: Image.Image, image_id: str, upscale_to: int,
+                 lob: str | None = None,
+                 angles: tuple = (90, 180, 270)) -> tuple[bool, int]:
+    """变体E：把放大后的 crop 再旋转 90/180/270 试读，返回 (是否命中, 命中角度)。
+
+    动机：Mac 的封口贴是折过盒子边缘粘贴的，正面拍摄时贴纸上的"扫码即领"文字
+    侧躺 90°。Mac 目前没有旋转兜底（SCAN_ORIENTATION_FALLBACK_LOBS 只含
+    Watch/AirPods）。本变体只在变体C 对该图失败后才跑，与生产"旋转作为第二轮
+    兜底"的语义一致，也避免给已命中的图白付成本。
+    """
+    boxes = V7.find_purple_scan_candidate_boxes(img, lob=lob)
+    for ci, (x1, y1, x2, y2) in enumerate(boxes, 1):
+        crop = upscale(img.crop((x1, y1, x2, y2)), upscale_to)
+        for ang in angles:
+            rot = crop.rotate(ang, expand=True)
+            _, texts, _, _, _ = V7.ocr_image_full(rot, f"{image_id}_p{ci}r{ang}")
+            if V7.has_scan_text(texts):
+                return True, ang
+    return False, 0
+
+
 def collect_row_images(row, cols, save_dir, tag) -> list[tuple[str, Image.Image]]:
     out = []
     for ci, col in enumerate(cols, 1):
@@ -160,6 +183,8 @@ def main():
     ap.add_argument('--hires', type=int, default=4000,
                     help='变体D 的整图长边上限（缺省 4000）')
     ap.add_argument('--no-hires', action='store_true', help='跳过变体D（省一次引擎重建）')
+    ap.add_argument('--no-rot', action='store_true',
+                    help='跳过变体E（旋转兜底）。E 只在 C 对该图失败后才跑')
     ap.add_argument('--gpu-mem-limit-mb', type=int, default=0,
                     help='单进程诊断，缺省 0=不限制')
     ap.add_argument('--save-images', default=None, help='把漏检行的整图存到该目录供人工查看')
@@ -212,12 +237,13 @@ def main():
     V7.init_worker_ocr(gpu_mem_limit_mb=args.gpu_mem_limit_mb)
     print('就绪，开始逐行测试（每行会重新下载图片）\n')
 
-    hit_a = hit_b = hit_c = 0
+    hit_a = hit_b = hit_c = hit_e = 0
     rows_with_purple = 0
+    rot_hit_angles = []
     long_sides, n_images = [], 0
     cached = []          # (tag, [(cid, img)]) 供变体D 复用，避免重复下载
     # 每张图各阶段耗时（秒），用于回答"开了这个会慢多少"
-    secs_a, secs_bc = [], []
+    secs_a, secs_bc, secs_e = [], [], []
     crop_records = []      # 逐候选的"不放大 vs 放大"读到了什么
     dumped_files = []      # 实际存盘的 crop 图（默认只存放大后才读出的那几对）
 
@@ -232,8 +258,9 @@ def main():
         n_images += len(imgs)
         long_sides += [max(im.size) for _, im in imgs]
 
-        a = b = c = False
+        a = b = c = e = False
         purple_here = 0
+        rot_angles_hit = []
         for cid, img in imgs:
             iid = f"{tag}_{cid}"
             t0 = time.perf_counter()
@@ -252,18 +279,30 @@ def main():
                 c = True
             secs_a.append(t1 - t0)
             secs_bc.append(t2 - t1)
+            # 变体E：仅当本图 C 未命中时才试旋转（与生产"旋转作为第二轮兜底"一致）
+            if not args.no_rot and not hc:
+                t3 = time.perf_counter()
+                hr, ang = crop_rot_hit(img, iid, args.upscale, lob=args.lob)
+                secs_e.append(time.perf_counter() - t3)
+                if hr:
+                    e = True
+                    rot_angles_hit.append(ang)
             if a and b and c:
                 break
 
         hit_a += a
         hit_b += (a or b)
         hit_c += (a or b or c)
+        hit_e += (a or b or c or e)
+        rot_angles_hit and rot_hit_angles.extend(rot_angles_hit)
         if purple_here:
             rows_with_purple += 1
         print(f"[{i}/{len(sample)}] {oid}  图{len(imgs)}张 "
               f"长边{max(max(im.size) for _, im in imgs)}  "
               f"紫候选{purple_here}  "
-              f"A={'✓' if a else '✗'} B={'✓' if b else '✗'} C={'✓' if c else '✗'}")
+              f"A={'✓' if a else '✗'} B={'✓' if b else '✗'} C={'✓' if c else '✗'}"
+              + ("" if args.no_rot else f" E={'✓' if e else '✗'}"
+                 + (f"({rot_angles_hit[0]}°)" if rot_angles_hit else "")))
 
     hit_d = None
     if not args.no_hires and cached:
@@ -302,6 +341,12 @@ def main():
     line('A 现状(0°整图,≤3000)', hit_a, '← 应为 0，否则抽样有问题')
     line('B A+紫贴crop(不放大)', hit_b, '← 只把 Mac 加进名单能拿到的')
     line(f'C A+紫贴crop放大到{args.upscale}', hit_c, '← 再补上真正的放大')
+    if not args.no_rot:
+        line('E C+crop旋转90/180/270', hit_e, '← 贴纸折过盒边、文字侧躺?')
+        if rot_hit_angles:
+            from collections import Counter
+            print(f"      命中角度分布: {dict(Counter(rot_hit_angles))}"
+                  f"  → 若集中在某一角度，说明贴法固定，生产只需试那一个角度")
     if hit_d is not None:
         line(f'D 0°整图长边≤{args.hires}', hit_d, '← 缩放是否为主因')
     print('=' * 76)

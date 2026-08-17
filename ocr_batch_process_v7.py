@@ -367,8 +367,12 @@ SCAN_PURPLE_HSV_HIGH = (165, 255, 245)
 #     3 倍 padding 足够把字包进来（实测 crop 567×295，放大 3.4 倍，贴纸占 15%）。
 # 其余 LOB 一律保持原参数：它们漏检率本就低（Watch 1.1%、AirPods 4.4%），
 # 动阈值只有回归风险没有收益。
+#   · V7.8.2：Mac 候选上限 5 → 8。0810 实测（S≥80 + 3 倍 padding 生效后）：
+#     每图候选顶满 5 个被截断的行，C 命中率仅 14%；未截断的行 38%——真贴纸还有
+#     一部分排在第 6 名以后被切掉。crop OCR 已降到 263ms/图（整图 558ms），多试
+#     3 个候选很便宜，且命中即停，只有真漏检的行才会跑满。
 SCAN_PURPLE_PROFILE_BY_LOB = {
-    "Mac": {"sat_min": 80, "perp_pad_mult": 3.0},
+    "Mac": {"sat_min": 80, "perp_pad_mult": 3.0, "max_candidates": 8},
 }
 SCAN_PURPLE_PERP_PAD_MULT = 9.0      # 默认：垂直于条带方向的 padding 倍数
 
@@ -856,12 +860,13 @@ def find_purple_scan_candidate_boxes(image_pil: Image.Image,
     注意：紫色只作为候选，不直接代表"封口贴存在"。最终仍必须 OCR 命中
     "扫码即领"锚点，避免把官方印刷紫色条带误当作封贴。
 
-    max_candidates=None 时在调用时读取全局配置——不能把全局当默认参数值，
-    那是在函数定义时求值的，worker 里改全局（--scan-crop-* 旋钮）不会生效。
+    max_candidates=None 时按 LOB 专属配置 → 全局配置的顺序解析。不能把全局当默认
+    参数值，那是在函数定义时求值的，worker 里改全局（--scan-crop-* 旋钮）不会生效。
+    调用方也不应显式传全局值：那会盖掉 LOB 专属配置（诊断脚本曾因此量出旧行为）。
     """
-    if max_candidates is None:
-        max_candidates = SCAN_LOCAL_CROP_MAX_CANDIDATES
     prof = SCAN_PURPLE_PROFILE_BY_LOB.get(lob or '', {})
+    if max_candidates is None:
+        max_candidates = prof.get('max_candidates', SCAN_LOCAL_CROP_MAX_CANDIDATES)
     sat_min = prof.get('sat_min', SCAN_PURPLE_HSV_LOW[1])
     perp_mult = prof.get('perp_pad_mult', SCAN_PURPLE_PERP_PAD_MULT)
     try:

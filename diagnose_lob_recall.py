@@ -58,8 +58,9 @@ def crop_scan_hit(img: Image.Image, image_id: str,
     lob 必须透传：紫色饱和度下限与 padding 倍数是按 LOB 取的
     （SCAN_PURPLE_PROFILE_BY_LOB），不传就回落到默认值，量出来的是旧行为。
     """
-    boxes = V7.find_purple_scan_candidate_boxes(
-        img, max_candidates=V7.SCAN_LOCAL_CROP_MAX_CANDIDATES, lob=lob)
+    # 不传 max_candidates：让它按 LOB 专属配置解析（显式传全局值会盖掉专属配置，
+    # 诊断脚本曾因类似的参数没透传而量出旧行为）
+    boxes = V7.find_purple_scan_candidate_boxes(img, lob=lob)
     for ci, (x1, y1, x2, y2) in enumerate(boxes, 1):
         crop = img.crop((x1, y1, x2, y2))
         if upscale_to:
@@ -83,8 +84,9 @@ def crop_compare(img: Image.Image, image_id: str, upscale_to: int,
     说明放大起了什么作用；其余候选存了没信息量，20 行样本能产生近 400 张图纯粹
     占地方。dump_all=True 才全量存，dump_limit 是文件数硬上限。
     """
-    boxes = V7.find_purple_scan_candidate_boxes(
-        img, max_candidates=V7.SCAN_LOCAL_CROP_MAX_CANDIDATES, lob=lob)
+    # 不传 max_candidates：让它按 LOB 专属配置解析（显式传全局值会盖掉专属配置，
+    # 诊断脚本曾因类似的参数没透传而量出旧行为）
+    boxes = V7.find_purple_scan_candidate_boxes(img, lob=lob)
     hit_plain = hit_up = False
     for ci, (x1, y1, x2, y2) in enumerate(boxes, 1):
         crop = img.crop((x1, y1, x2, y2))
@@ -197,8 +199,9 @@ def main():
     _sat = _prof.get('sat_min', V7.SCAN_PURPLE_HSV_LOW[1])
     _pad = _prof.get('perp_pad_mult',
                      getattr(V7, 'SCAN_PURPLE_PERP_PAD_MULT', 9.0))
+    _cand = _prof.get('max_candidates', V7.SCAN_LOCAL_CROP_MAX_CANDIDATES)
     print(f"本次生效的紫贴参数（LOB={args.lob}）: 饱和度下限 S≥{_sat}，"
-          f"垂直padding {_pad}× 厚度，每图最多 {V7.SCAN_LOCAL_CROP_MAX_CANDIDATES} 个候选")
+          f"垂直padding {_pad}× 厚度，每图最多 {_cand} 个候选")
     if _prof:
         print(f"  ← 命中 {args.lob} 专属配置 {_prof}")
     else:

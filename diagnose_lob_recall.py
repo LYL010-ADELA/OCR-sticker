@@ -52,10 +52,14 @@ def full_ocr_hit(img: Image.Image, image_id: str) -> bool:
 
 
 def crop_scan_hit(img: Image.Image, image_id: str,
-                  upscale_to: int | None) -> tuple[bool, int]:
-    """返回 (是否命中, 紫色候选个数)。候选数为 0 说明紫贴检测本身没找到东西。"""
+                  upscale_to: int | None, lob: str | None = None) -> tuple[bool, int]:
+    """返回 (是否命中, 紫色候选个数)。候选数为 0 说明紫贴检测本身没找到东西。
+
+    lob 必须透传：紫色饱和度下限与 padding 倍数是按 LOB 取的
+    （SCAN_PURPLE_PROFILE_BY_LOB），不传就回落到默认值，量出来的是旧行为。
+    """
     boxes = V7.find_purple_scan_candidate_boxes(
-        img, max_candidates=V7.SCAN_LOCAL_CROP_MAX_CANDIDATES)
+        img, max_candidates=V7.SCAN_LOCAL_CROP_MAX_CANDIDATES, lob=lob)
     for ci, (x1, y1, x2, y2) in enumerate(boxes, 1):
         crop = img.crop((x1, y1, x2, y2))
         if upscale_to:
@@ -68,8 +72,8 @@ def crop_scan_hit(img: Image.Image, image_id: str,
 
 def crop_compare(img: Image.Image, image_id: str, upscale_to: int,
                  dump_dir: str | None, tag: str, records: list,
-                 dumped: list, dump_limit: int = 40, dump_all: bool = False
-                 ) -> tuple[bool, bool, int]:
+                 dumped: list, dump_limit: int = 40, dump_all: bool = False,
+                 lob: str | None = None) -> tuple[bool, bool, int]:
     """逐个紫贴候选同时跑"不放大"和"放大"两种 OCR，便于逐框对照放大的效果。
 
     返回 (不放大是否命中, 放大是否命中, 候选个数)。两边各自"命中即停"，
@@ -80,7 +84,7 @@ def crop_compare(img: Image.Image, image_id: str, upscale_to: int,
     占地方。dump_all=True 才全量存，dump_limit 是文件数硬上限。
     """
     boxes = V7.find_purple_scan_candidate_boxes(
-        img, max_candidates=V7.SCAN_LOCAL_CROP_MAX_CANDIDATES)
+        img, max_candidates=V7.SCAN_LOCAL_CROP_MAX_CANDIDATES, lob=lob)
     hit_plain = hit_up = False
     for ci, (x1, y1, x2, y2) in enumerate(boxes, 1):
         crop = img.crop((x1, y1, x2, y2))
@@ -187,6 +191,18 @@ def main():
     print(f"本次抽样: {len(sample)} 行；图片列 {len(cols)} 个")
     print(f"变体C 放大到长边 {args.upscale}；变体D 整图上限 {args.hires}"
           + ("（已跳过）" if args.no_hires else ""))
+    # 实际生效的紫贴检测参数——按 LOB 取（SCAN_PURPLE_PROFILE_BY_LOB）。
+    # 打印出来是为了让"参数没透传进去"这类问题当场暴露，而不是白跑一轮才发现。
+    _prof = getattr(V7, 'SCAN_PURPLE_PROFILE_BY_LOB', {}).get(args.lob, {})
+    _sat = _prof.get('sat_min', V7.SCAN_PURPLE_HSV_LOW[1])
+    _pad = _prof.get('perp_pad_mult',
+                     getattr(V7, 'SCAN_PURPLE_PERP_PAD_MULT', 9.0))
+    print(f"本次生效的紫贴参数（LOB={args.lob}）: 饱和度下限 S≥{_sat}，"
+          f"垂直padding {_pad}× 厚度，每图最多 {V7.SCAN_LOCAL_CROP_MAX_CANDIDATES} 个候选")
+    if _prof:
+        print(f"  ← 命中 {args.lob} 专属配置 {_prof}")
+    else:
+        print(f"  ← 使用默认配置（{args.lob} 没有专属配置）")
     print('=' * 76)
 
     print('\n初始化 PaddleOCR …')
@@ -223,7 +239,8 @@ def main():
             t1 = time.perf_counter()
             hb, hc, nb = crop_compare(img, iid, args.upscale,
                                       args.dump_crops, oid, crop_records,
-                                      dumped_files, args.dump_limit, args.dump_all)
+                                      dumped_files, args.dump_limit, args.dump_all,
+                                      lob=args.lob)
             t2 = time.perf_counter()
             purple_here += nb
             if hb:
@@ -331,10 +348,16 @@ def main():
             print("\n  （未存任何文件；需要肉眼比对时加 --dump-crops 目录名）")
 
     print("\n判读：")
+    print("  · 先核对上面『本次生效的紫贴参数』是否与预期一致——不一致说明参数没"
+          "透传，量出来的是旧行为")
+    print("  · crop 尺寸普遍接近整图 → 候选框住的不是贴纸而是背景/台面，"
+          "该收紧饱和度下限或缩小 padding")
     print("  · 紫色候选检出率低 → 紫贴路径对该 LOB 无效，得另想办法（分块 OCR 等）")
     print("  · C 明显高于 B    → 放大是关键，值得把放大补进生产路径")
-    print("  · D 明显高于 A    → 3000px 缩放确实是主因，可考虑对大盒 LOB 提高上限")
-    print("  · 都很低          → 贴纸多半真的不在画面里/被遮挡，属拍摄规范问题而非算法")
+    if hit_d is not None:
+        print("  · D 明显高于 A    → 整图缩放是主因，可考虑对大盒 LOB 提高上限")
+    print("  · 都很低且 crop 已经很紧凑 → 多半是贴纸文字方向不正（折过盒边侧躺）"
+          "或真的不在画面里")
 
 
 if __name__ == '__main__':

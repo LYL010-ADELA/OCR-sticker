@@ -257,6 +257,7 @@ import json
 import argparse
 import multiprocessing as mp
 import glob
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 # 注意：PaddleOCR 的导入被刻意推迟到每个 worker 进程的 init_worker_ocr() 内部，
@@ -301,9 +302,15 @@ OOM_RESPAWN_MAX_STRIKES = 3
 # V7.2 实测：清缓存+退避重试救不了"显存被邻居进程囤走"的场景（连紫贴小图都会
 # OOM）——empty_cache 只能清本进程的缓存。硬上限让任何进程到达自己额度时必须
 # 回收自己的空闲缓存，而不是伸手抢占全卡剩余，从机制上杜绝跨进程囤积挤兑。
-# 默认按 8 worker × 3300MB ≈ 26.4GB 设计（32GB 卡留 ~5GB 给桌面与峰值余量）；
-# 调整 --workers 时请同步调整：limit ≈ (显存总量MB - 2000) / workers。
-DEFAULT_GPU_MEM_LIMIT_MB = 3300
+# V7.9：默认值改为 5 worker × 5600MB ≈ 28GB（32GB 卡留 4GB 余量）。
+# 此前默认是 12 worker × 3300MB = 39.6GB，超出 32GB 卡整整 7.6GB——正是 0803
+# 事故的配置；而当时注释写的却是"按 8 worker 设计"，与 --workers 的缺省值 12
+# 自相矛盾。忘记带参数就会重演事故，故把两个缺省值改成实测最优且互相一致。
+# 4500MB 也不够：0808 有 worker 在同两行上反复 OOM 直到被放弃（当时全卡只剩它
+# 一个进程、显存空着，排除跨进程挤兑，纯粹是单次 3000px 推理超过自己额度）。
+# 换卡时按 limit ≈ (显存总量MB - 2000) / workers 调整，且保证单进程 ≥5000MB。
+DEFAULT_GPU_MEM_LIMIT_MB = 5600
+DEFAULT_WORKERS = 5
 
 # V7.2：OOM 当场消化。
 # 整图 OCR 跨进程并发闸：只有长边 ≥ OCR_GATE_MIN_SIDE 的输入占名额，防止多个
@@ -2959,6 +2966,64 @@ def cleanup_shards(output_csv: str) -> int:
     return removed
 
 
+def _query_gpu_total_mb() -> int | None:
+    """用 nvidia-smi 问一下卡的总显存（MB）；拿不到返回 None。
+
+    不用 paddle 查是为了避免在主进程 import paddle——主进程本来不碰 CUDA，
+    worker 才 import（spawn 要求），主进程引入会拖慢启动并可能占显存。
+    """
+    try:
+        out = subprocess.run(
+            ['nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=10)
+        if out.returncode != 0:
+            return None
+        vals = [int(x.strip()) for x in out.stdout.split('\n') if x.strip().isdigit()]
+        return max(vals) if vals else None
+    except Exception:
+        return None
+
+
+def check_gpu_budget(args) -> None:
+    """开机自检显存预算：workers × gpu_mem_limit_mb 必须留够余量。
+
+    0803 事故就是显存超订（12 进程各囤到显存耗尽 → 整图 OCR 大块分配集体 OOM →
+    约 65% 行被误判"未找到背面图"）。当时无人拦一下，跑了数小时才发现。
+    这里只警告不强退：显存可能被别的进程临时占着，或用户明知在做压力测试。
+    """
+    if not args.gpu_mem_limit_mb or args.gpu_mem_limit_mb <= 0:
+        print("  ⚠ 未设 --gpu-mem-limit-mb（0=不限制）：多进程共享单卡时 auto_growth "
+              "缓存会只增不还并互相挤兑，强烈建议设置")
+        return
+    budget = args.workers * args.gpu_mem_limit_mb
+    total = _query_gpu_total_mb()
+    if total is None:
+        print(f"  显存预算: {args.workers} × {args.gpu_mem_limit_mb}MB = "
+              f"{budget / 1024:.1f}GB（未能读取本机显存总量，无法校验）")
+        return
+    safe = total - 2000        # 给桌面/驱动/峰值留 2GB
+    verdict = "✓ 合适" if budget <= safe else "✗ 超订！"
+    print(f"  显存预算: {args.workers} × {args.gpu_mem_limit_mb}MB = {budget / 1024:.1f}GB"
+          f" / 本机 {total / 1024:.1f}GB（可用上限 {safe / 1024:.1f}GB） {verdict}")
+    if budget > safe:
+        # 单进程额度不能低于 MIN_PER_PROC：3000px 推理工作集约 4-5GB，压太紧会撞
+        # 自己额度、退避重试后仍失败，速度崩到 0.3 行/秒（V7.3 实测）。所以优先
+        # 建议减 worker，只有在额度仍能守住下限时才建议降额度。
+        MIN_PER_PROC = 5000
+        print(f"  ⚠ 显存超订 {(budget - safe) / 1024:.1f}GB。跑数小时后会重演 0803 事故："
+              f"缓存耗尽显存 → 整图 OCR 集体 OOM 且约 65% 行被误判'未找到背面图'。")
+        rec_workers = max(1, safe // max(1, args.gpu_mem_limit_mb))
+        print(f"    建议 --workers {rec_workers} --gpu-mem-limit-mb {args.gpu_mem_limit_mb}"
+              f"（保持额度、减进程）")
+        rec_limit = safe // max(1, args.workers)
+        if rec_limit >= MIN_PER_PROC:
+            print(f"    或   --workers {args.workers} --gpu-mem-limit-mb {rec_limit}"
+                  f"（保持进程、降额度）")
+        else:
+            print(f"    不建议保持 {args.workers} 个进程：那样每进程只剩 {rec_limit}MB，"
+                  f"低于 {MIN_PER_PROC}MB 下限，会撞自己额度而速度崩溃")
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description='OCR 封口贴检测 V7 —— 配件宽松判定（扫码即=封口贴存在），多进程并行')
@@ -2970,8 +3035,11 @@ def parse_args():
                    help='最终合并 CSV 路径（缺省由 --input 推导为 {stem}_results.csv）')
     p.add_argument('--output-excel', default=None,
                    help='最终 Excel 路径（缺省由 --input 推导为 {stem}_processed.xlsx）')
-    p.add_argument('--workers', type=int, default=min(12, os.cpu_count() or 4),
-                   help='worker 进程数（缺省 = min(12, CPU核数)）')
+    p.add_argument('--workers', type=int,
+                   default=min(DEFAULT_WORKERS, os.cpu_count() or 4),
+                   help=f'worker 进程数（缺省 {DEFAULT_WORKERS}）。上限由显存而非 CPU '
+                        f'决定：每进程 3000px 推理工作集约 4-5GB，配合 '
+                        f'--gpu-mem-limit-mb 满足 workers × limit ≤ 显存-2GB')
     p.add_argument('--download-workers', type=int, default=DOWNLOAD_WORKERS,
                    help='每个 worker 内部的下载线程数')
     p.add_argument('--prefetch', type=int, default=3,
@@ -3172,9 +3240,8 @@ def main():
     print(f"整图OCR并发上限: {args.ocr_concurrency}"
           f"（全局，仅长边≥{OCR_GATE_MIN_SIDE}px 的大图推理占名额）")
     print(f"每进程显存硬上限: "
-          f"{str(args.gpu_mem_limit_mb) + 'MB' if args.gpu_mem_limit_mb else '不限制'}"
-          f"（workers={args.workers}，合计约 "
-          f"{args.gpu_mem_limit_mb * args.workers // 1024 if args.gpu_mem_limit_mb else 0}GB）")
+          f"{str(args.gpu_mem_limit_mb) + 'MB' if args.gpu_mem_limit_mb else '不限制'}")
+    check_gpu_budget(args)
     _up_lobs = args.scan_crop_upscale_lobs
     print(f"紫贴局部OCR: 启用 LOB {'/'.join(sorted(SCAN_LOCAL_CROP_LOBS))} + 全部配件，"
           f"每图最多 {args.scan_crop_candidates} 个候选")

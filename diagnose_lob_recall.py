@@ -76,7 +76,8 @@ def crop_scan_hit(img: Image.Image, image_id: str,
 def crop_compare(img: Image.Image, image_id: str, upscale_to: int,
                  dump_dir: str | None, tag: str, records: list,
                  dumped: list, dump_limit: int = 40, dump_all: bool = False,
-                 lob: str | None = None) -> tuple[bool, bool, int]:
+                 lob: str | None = None,
+                 auth_seen: set | None = None) -> tuple[bool, bool, int]:
     """逐个紫贴候选同时跑"不放大"和"放大"两种 OCR，便于逐框对照放大的效果。
 
     返回 (不放大是否命中, 放大是否命中, 候选个数)。两边各自"命中即停"，
@@ -88,6 +89,8 @@ def crop_compare(img: Image.Image, image_id: str, upscale_to: int,
     """
     # 不传 max_candidates：让它按 LOB 专属配置解析（显式传全局值会盖掉专属配置，
     # 诊断脚本曾因类似的参数没透传而量出旧行为）
+    if auth_seen is None:
+        auth_seen = set()
     boxes = V7.find_purple_scan_candidate_boxes(img, lob=lob)
     hit_plain = hit_up = False
     for ci, (x1, y1, x2, y2) in enumerate(boxes, 1):
@@ -123,6 +126,16 @@ def crop_compare(img: Image.Image, image_id: str, upscale_to: int,
             crop.save(p1, quality=92)
             crop_up.save(p2, quality=92)
             dumped.extend([p1, p2])
+        # 顺手看看这些 crop 里有没有读到"通用无码二贴"的文字（Apple授权专营店/
+        # 在你身边）。复用上面已经取到的 OCR 文本，零额外推理成本。规范 p19 要求
+        # 一贴（太阳码）张贴合规后才可贴二贴，所以二贴可读是"贴了封口贴"的间接
+        # 证据——但不能无条件采信：部分零售盒（如 AirPods）盒面本身就印着这串字，
+        # 见 OFFICIAL_PRINT_KEYWORDS 的注释。
+        AUTH_KW = ("Apple授权专营店", "授权专营店", "在你身边", "在您身边")
+        for _t in (txt_plain, txt_up):
+            if _t and any(k in _t for k in AUTH_KW):
+                auth_seen.add(tag)
+                break
         records.append({
             '订单号': tag, '图': image_id.split('_')[-1], '候选': ci,
             'crop尺寸': f"{crop.size[0]}x{crop.size[1]}",
@@ -245,6 +258,7 @@ def main():
     # 每张图各阶段耗时（秒），用于回答"开了这个会慢多少"
     secs_a, secs_bc, secs_e = [], [], []
     crop_records = []      # 逐候选的"不放大 vs 放大"读到了什么
+    auth_rows = set()      # 读到了"通用无码二贴"文字的行（订单号）
     dumped_files = []      # 实际存盘的 crop 图（默认只存放大后才读出的那几对）
 
     for i, (_, row) in enumerate(sample.iterrows(), 1):
@@ -270,7 +284,7 @@ def main():
             hb, hc, nb = crop_compare(img, iid, args.upscale,
                                       args.dump_crops, oid, crop_records,
                                       dumped_files, args.dump_limit, args.dump_all,
-                                      lob=args.lob)
+                                      lob=args.lob, auth_seen=auth_rows)
             t2 = time.perf_counter()
             purple_here += nb
             if hb:
@@ -349,6 +363,15 @@ def main():
                   f"  → 若集中在某一角度，说明贴法固定，生产只需试那一个角度")
     if hit_d is not None:
         line(f'D 0°整图长边≤{args.hires}', hit_d, '← 缩放是否为主因')
+
+    # 参考项：不改判定口径，只报"这些行里能不能读到二贴文字"
+    n_auth = len(auth_rows)
+    print(f"\n  [参考] 读到『通用无码二贴』文字(Apple授权专营店/在你身边)的行: "
+          f"{n_auth}/{tested} ({n_auth / tested * 100:.0f}%)")
+    print("          规范 p19：一贴(太阳码)须合规张贴后才可贴二贴，故二贴可读"
+          "是『贴了封口贴』的间接证据")
+    print("          但不可无条件采信——部分零售盒盒面本身印有这串字"
+          "(见 OFFICIAL_PRINT_KEYWORDS)。是否采纳属判定口径变更，需业务确认")
     print('=' * 76)
 
     # ── 开销：只有"0° 未命中的图"才会付紫贴的钱，命中即停 ──────────────────

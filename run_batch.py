@@ -7,12 +7,14 @@
     喂回去，会产出 `xxx_processed_results.csv` 这种垃圾并浪费数小时。
   · 已完成的天自动跳过：判定标准是"结果 CSV 存在且验收硬检查通过"，而不是只看
     文件在不在——半途中断的结果文件也在，但行数不全。
-  · 单天失败不影响后续天，但连续失败达阈值即停止：那通常是环境级故障
-    （GPU 掉了、显存被别人占满），继续跑只是白烧几小时。
+  · 严格串行：一天必须"跑完 + 验收硬检查过 + ERROR 行占比达标"三道闸全过，
+    才进入下一天；任何一道不过就停下来等人处理（--keep-going 可改成继续）。
+    这样不会出现"中间某天悄悄坏了、后面几天照跑"的情况。
   · 实时输出 + 落盘日志同时要：用 tee 而非 capture，这样 screen 里能看进度条，
     事后也有完整日志可查。exit code 用 pipefail 保住，不会被 tee 吞掉。
-  · 缺省关掉补下载重试轮：0811 实测该轮 20.3min 恢复 0/1337 行（0.0%），
-    0807/0808 也只有 1.0-1.3%。8 天累计要烧 3 小时换回个位数行。要开加 --with-retry。
+  · 补下载重试轮缺省开启（每天多约 20-30min）。实测恢复率很低（0811 是 0/1337、
+    0807/0808 约 1.0-1.3%），但它是下载抖动的安全网，且能把 ERROR 行压到接近 0，
+    配合上面的 ERROR 闸更稳。赶时间可用 --no-retry 关掉。
 
 用法（务必放进 screen/tmux，几小时的活）：
     screen -S ocr
@@ -90,16 +92,28 @@ def verify_quiet(xlsx: str) -> tuple[bool, str]:
     return ok, rows
 
 
-def lob_summary(xlsx: str) -> str:
-    """从结果 CSV 里取各 LOB 无贴率，用于汇总表（跑完一眼看质量是否异常）。"""
+def result_quality(xlsx: str) -> dict:
+    """读结果 CSV，返回质量指标：行数、ERROR 行数/占比、各 LOB 无贴率。
+
+    ERROR 行占比是"这一天到底跑干净了没有"的关键指标：V7.6 起没有结果的行会被
+    回填成 ERROR 占位，所以 ERROR 行多意味着有 worker 被放弃或大量行没跑成。
+    """
+    out = {'rows': 0, 'errors': 0, 'error_pct': 0.0, 'lob': '(无结果)'}
     csv = results_csv_for(xlsx)
     if not os.path.exists(csv):
-        return '(无结果)'
+        return out
     try:
         df = pd.read_csv(csv, encoding='utf-8-sig', dtype=str,
-                         usecols=['识别LOB', '封口贴存在'], on_bad_lines='skip')
+                         usecols=['识别LOB', '封口贴存在', '位置说明'],
+                         on_bad_lines='skip')
     except Exception as e:
-        return f'(读取失败 {type(e).__name__})'
+        out['lob'] = f'(读取失败 {type(e).__name__})'
+        return out
+    out['rows'] = len(df)
+    if len(df):
+        err = df['位置说明'].astype(str).str.startswith('ERROR', na=False)
+        out['errors'] = int(err.sum())
+        out['error_pct'] = out['errors'] / len(df) * 100
     seal = pd.to_numeric(df['封口贴存在'], errors='coerce')
     parts = []
     for lob in ['iPhone', 'Mac', 'iPad', 'Watch', 'AirPods', 'Accy.']:
@@ -109,7 +123,33 @@ def lob_summary(xlsx: str) -> str:
             continue
         bad = int((m & (seal == 0)).sum())
         parts.append(f'{lob} {bad / n * 100:.1f}%')
-    return '无贴率: ' + '  '.join(parts) if parts else '(无 LOB 数据)'
+    if parts:
+        out['lob'] = '无贴率: ' + '  '.join(parts)
+    return out
+
+
+def day_problems(xlsx: str, max_error_pct: float,
+                 rc: int | None = None) -> tuple[list[str], str, dict]:
+    """判定"这天有没有问题"，返回 (问题列表, 验收摘要行, 质量指标)。
+
+    计划阶段（判断能否跳过）和跑完之后（判断能否进入下一天）**必须共用这一个**
+    函数：若计划阶段只查验收、跑完之后又多查 ERROR 占比，那么一个 ERROR 超标的
+    天会在下次重跑时被当成"已完成"跳过，永远修不上。
+    """
+    problems = []
+    if rc is not None and rc != 0:
+        problems.append(f'v7 退出码 {rc}')
+        return problems, '', {'rows': 0, 'errors': 0, 'error_pct': 0.0, 'lob': '—'}
+    if not os.path.exists(results_csv_for(xlsx)):
+        return ['无结果文件'], '', {'rows': 0, 'errors': 0, 'error_pct': 0.0, 'lob': '—'}
+    ok, rows_line = verify_quiet(xlsx)
+    if not ok:
+        problems.append('验收硬检查未过（行数/订单号对不上）')
+    q = result_quality(xlsx)
+    if q['error_pct'] > max_error_pct:
+        problems.append(f"ERROR 行 {q['errors']} 占 {q['error_pct']:.2f}%"
+                        f" > {max_error_pct}%")
+    return problems, rows_line, q
 
 
 def main():
@@ -122,13 +162,15 @@ def main():
     ap.add_argument('--skip', default='', help='跳过这些日期，逗号分隔')
     ap.add_argument('--workers', type=int, default=5)
     ap.add_argument('--gpu-mem-limit-mb', type=int, default=5600)
-    ap.add_argument('--with-retry', action='store_true',
-                    help='开启补下载重试轮（缺省关闭：0811 实测 20min 恢复 0.0%%）')
+    ap.add_argument('--no-retry', action='store_true',
+                    help='关闭补下载重试轮（缺省开启，每天多约 20-30min）')
     ap.add_argument('--rescan-lob', default='',
                     help='透传给 v7：强制重跑指定 LOB 的漏检行（如 Mac）。'
                          '注意这会让"已完成"的天也需要重跑')
-    ap.add_argument('--max-consecutive-failures', type=int, default=2,
-                    help='连续失败达此数即停止（缺省 2；环境级故障时避免白烧几小时）')
+    ap.add_argument('--keep-going', action='store_true',
+                    help='某天出问题也继续跑后面的天（缺省是停下来等人处理）')
+    ap.add_argument('--max-error-pct', type=float, default=0.5,
+                    help='ERROR 行占比超过此百分比即视为"这天有问题"（缺省 0.5）')
     ap.add_argument('--force', action='store_true',
                     help='已验收通过的天也重跑（默认跳过）')
     ap.add_argument('--dry-run', action='store_true', help='只列计划，不执行')
@@ -157,8 +199,10 @@ def main():
     print('=' * 78)
     print(f'批量 OCR 计划（共发现 {len(inputs)} 个源表）')
     print(f'参数: --workers {args.workers} --gpu-mem-limit-mb {args.gpu_mem_limit_mb}'
-          f'  补下载重试轮: {"开" if args.with_retry else "关"}'
+          f'  补下载重试轮: {"关" if args.no_retry else "开"}'
           + (f'  --rescan-lob {args.rescan_lob}' if args.rescan_lob else ''))
+    print(f'出问题时: {"继续跑后面的天" if args.keep_going else "停下来等人处理（严格模式）"}'
+          f'  ｜ 判定为有问题: 验收硬检查未过，或 ERROR 行占比 > {args.max_error_pct}%')
     print('=' * 78)
     plan = []
     for p in inputs:
@@ -168,8 +212,9 @@ def main():
         if not os.path.exists(results_csv_for(p)):
             plan.append((p, '待跑(无结果)'))
             continue
-        ok, _ = verify_quiet(p)
-        plan.append((p, '已完成(跳过)' if ok else '待跑(验收未过)'))
+        probs, _, _ = day_problems(p, args.max_error_pct)
+        plan.append((p, '已完成(跳过)' if not probs
+                     else f'待跑({probs[0][:20]})'))
     for p, st in plan:
         mark = '·' if st.startswith('已完成') else '→'
         print(f'  {mark} {day_key(p):<8} {os.path.basename(p):<40} {st}')
@@ -185,7 +230,7 @@ def main():
 
     # ── 逐天执行 ────────────────────────────────────────────────────────
     results = []
-    consec_fail = 0
+    stopped_at = None
     t_all = time.time()
     for i, xlsx in enumerate(todo, 1):
         day = day_key(xlsx)
@@ -197,7 +242,7 @@ def main():
         cmd = [sys.executable, OCR_SCRIPT, xlsx,
                '--workers', str(args.workers),
                '--gpu-mem-limit-mb', str(args.gpu_mem_limit_mb),
-               '--extra-retry-passes', '1' if args.with_retry else '0']
+               '--extra-retry-passes', '0' if args.no_retry else '1']
         if args.rescan_lob:
             cmd += ['--rescan-lob', args.rescan_lob]
 
@@ -213,27 +258,31 @@ def main():
             break
         mins = (time.time() - t0) / 60
 
-        if rc != 0:
-            consec_fail += 1
-            results.append((day, f'✗ v7 退出码 {rc}', f'{mins:.0f}min', '—'))
-            print(f'\n✗ {day} 运行失败（退出码 {rc}），详见 {log}')
-            if consec_fail >= args.max_consecutive_failures:
-                print(f'\n⚠ 连续 {consec_fail} 天失败，停止批量——通常是环境级问题'
-                      f'（GPU/显存/磁盘），继续跑只是白烧时间。请先看 {log} 排查。')
-                break
+        # ── 三道闸全过才算"这天没问题"，否则默认停下来等人 ──────────────
+        problems, rows_line, q = day_problems(xlsx, args.max_error_pct, rc=rc)
+        status = '✓ 通过' if not problems else '✗ ' + '；'.join(problems)
+        results.append((day, status, f'{mins:.0f}min', q['lob']))
+
+        if not problems:
+            print(f'\n✓ {day} 完成并验收通过（{mins:.0f}min）  {rows_line}'
+                  + (f"  ERROR 行 {q['errors']}" if q['errors'] else '  无 ERROR 行'))
+            print(f'  {q["lob"]}')
             continue
 
-        ok, rows = verify_quiet(xlsx)
-        consec_fail = 0 if ok else consec_fail + 1
-        results.append((day, '✓ 通过' if ok else '✗ 验收未过',
-                        f'{mins:.0f}min', lob_summary(xlsx)))
-        print(f'\n{"✓" if ok else "✗"} {day} {"完成并验收通过" if ok else "验收未通过"}'
-              f'（{mins:.0f}min）  {rows}')
-        if not ok:
-            print(f'  ⚠ 验收未通过，请手工跑: python3 {VERIFY_SCRIPT} {xlsx}')
-            if consec_fail >= args.max_consecutive_failures:
-                print(f'\n⚠ 连续 {consec_fail} 天验收未过，停止批量。')
-                break
+        print(f'\n✗ {day} 有问题（{mins:.0f}min）：')
+        for p in problems:
+            print(f'    · {p}')
+        print(f'  完整日志: {log}')
+        print(f'  手工复查: python3 {VERIFY_SCRIPT} {xlsx}')
+        print(f'  修好后重跑本脚本即可——已通过的天会自动跳过，'
+              f'这天也会从分片断点续传')
+        if not args.keep_going:
+            stopped_at = day
+            remaining = [day_key(x) for x in todo[i:]]
+            print(f'\n⚠ 严格模式：停止批量，不再跑后面的天。'
+                  + (f'剩余未跑: {", ".join(remaining)}' if remaining else '（本来就是最后一天）'))
+            print(f'  想让它跳过问题天继续跑，加 --keep-going')
+            break
 
     # ── 汇总 ────────────────────────────────────────────────────────────
     lines = ['', '=' * 78,
@@ -243,9 +292,13 @@ def main():
     for day, st, mins, lob in results:
         lines.append(f'{day:<8}{st:<16}{mins:<10}{lob}')
     n_ok = sum(1 for _, st, _, _ in results if st.startswith('✓'))
-    lines += ['-' * 78,
-              f'通过 {n_ok}/{len(results)}；未通过的天可单独重跑，会断点续传',
-              '=' * 78]
+    lines += ['-' * 78, f'通过 {n_ok}/{len(results)}']
+    if stopped_at:
+        lines.append(f'因 {stopped_at} 有问题而提前停止（严格模式）。'
+                     f'处理完该天后重跑本脚本，已通过的天会自动跳过。')
+    else:
+        lines.append('未通过的天可单独重跑，会断点续传。')
+    lines.append('=' * 78)
     out = '\n'.join(lines)
     print(out)
     with open(os.path.join(LOG_DIR, 'summary.txt'), 'a', encoding='utf-8') as f:
